@@ -285,6 +285,29 @@ def extract_keepa_discount_percent(deal_item: Dict[str, Any]) -> Optional[float]
     return None
 
 
+def extract_price_from_deal_item(deal_item: Dict[str, Any]) -> Optional[str]:
+    for key in ("current", "currentPrice", "price"):
+        value = deal_item.get(key)
+
+        if isinstance(value, (list, tuple)) and value:
+            value = value[0]
+
+        if not isinstance(value, (int, float)):
+            continue
+
+        if value <= 0:
+            continue
+
+        # Keepa price values are typically in euro cents.
+        if value > 1000:
+            return format_eur(float(value) / 100.0)
+
+        # Fallback for already-normalized numeric prices.
+        return format_eur(float(value))
+
+    return None
+
+
 def build_caption(
     title: str,
     price: str,
@@ -363,11 +386,22 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
             None, lambda: get_amazon_data(session, asin)
         )
 
-        if not price:
-            logger.warning("Prezzo non trovato per %s", asin)
-            return
-
         keepa_discount = extract_keepa_discount_percent(deal_item)
+        if not price:
+            price = extract_price_from_deal_item(deal_item)
+            if price:
+                logger.warning(
+                    "Prezzo Amazon non trovato per %s, uso fallback Keepa: %s",
+                    asin,
+                    price,
+                )
+            else:
+                price = "Prezzo non disponibile"
+                logger.warning(
+                    "Prezzo Amazon non trovato per %s e fallback Keepa assente",
+                    asin,
+                )
+
         discount_percent = compute_discount_percent(price, old_price, keepa_discount)
 
         link = "https://www.amazon.it/dp/{}?tag={}".format(asin, cfg.affiliate_tag)
