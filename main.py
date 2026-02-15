@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -114,8 +115,67 @@ def save_sent_asins(path: str, asins: Set[str]) -> None:
     )
 
 
+def parse_price_to_float(price_text: Optional[str]) -> Optional[float]:
+    if not price_text:
+        return None
+
+    normalized = (
+        price_text.replace("€", "")
+        .replace("EUR", "")
+        .replace("\xa0", " ")
+        .strip()
+    )
+
+    matches = re.findall(r"\d+[\.,]?\d*", normalized)
+    if not matches:
+        return None
+
+    number = matches[-1].replace(".", "").replace(",", ".")
+    try:
+        return float(number)
+    except ValueError:
+        return None
+
+
+def format_eur(value: float) -> str:
+    text = "{:.2f}".format(value)
+    return text.replace(".", ",") + "€"
+
+
+def compute_discount_percent(current_price: Optional[str], old_price: Optional[str], fallback: Optional[float]) -> Optional[float]:
+    current = parse_price_to_float(current_price)
+    old = parse_price_to_float(old_price)
+
+    if current is not None and old is not None and old > 0 and old > current:
+        return round(((old - current) / old) * 100.0, 1)
+
+    if fallback is not None:
+        return round(float(fallback), 1)
+
+    return None
+
+
+def discount_badge(discount_percent: Optional[float]) -> str:
+    if discount_percent is None:
+        return "💥 PREZZO INTERESSANTE"
+
+    if discount_percent > 40:
+        return "❌ POSSIBILE ERRORE ❌"
+
+    if 15 <= discount_percent <= 20:
+        return "💣 PREZZO BOMBA 💣"
+
+    if discount_percent < 15:
+        return "🔥 PREZZO AFFARE 🔥"
+
+    return "‼️ SUPER PREZZO ‼️"
+
+
 # -------- PRENDI DATI AMAZON --------
-def get_amazon_data(session: requests.Session, asin: str) -> Tuple[str, Optional[str], Optional[str]]:
+def get_amazon_data(
+    session: requests.Session,
+    asin: str,
+) -> Tuple[str, Optional[str], Optional[str], Optional[str]]:
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Linux; Android 10; SM-G973F) "
@@ -134,7 +194,7 @@ def get_amazon_data(session: requests.Session, asin: str) -> Tuple[str, Optional
     title = title_tag.get_text(strip=True) if title_tag else "Offerta Amazon"
 
     price = None
-    selectors = [
+    current_price_selectors = [
         "span.a-price span.a-offscreen",
         "span.a-offscreen",
         "#corePriceDisplay_desktop_feature_div span.a-offscreen",
@@ -142,12 +202,28 @@ def get_amazon_data(session: requests.Session, asin: str) -> Tuple[str, Optional
         "#priceblock_dealprice",
     ]
 
-    for selector in selectors:
+    for selector in current_price_selectors:
         tag = soup.select_one(selector)
         if tag:
             text = tag.get_text(strip=True)
-            if text:
+            if text and "€" in text:
                 price = text
+                break
+
+    old_price = None
+    old_price_selectors = [
+        "span.a-price.a-text-price span.a-offscreen",
+        "#corePriceDisplay_desktop_feature_div .a-text-price .a-offscreen",
+        ".basisPrice .a-offscreen",
+        "span.priceBlockStrikePriceString",
+    ]
+
+    for selector in old_price_selectors:
+        tag = soup.select_one(selector)
+        if tag:
+            text = tag.get_text(strip=True)
+            if text and "€" in text:
+                old_price = text
                 break
 
     image_selectors = [
@@ -171,7 +247,7 @@ def get_amazon_data(session: requests.Session, asin: str) -> Tuple[str, Optional
     if image_url and image_url.startswith("/"):
         image_url = "https://m.media-amazon.com" + image_url
 
-    return title, price, image_url
+    return title, price, old_price, image_url
 
 
 def download_image_bytes(session: requests.Session, url: str) -> Optional[BytesIO]:
@@ -187,6 +263,54 @@ def download_image_bytes(session: requests.Session, url: str) -> Optional[BytesI
         return None
 
 
+def pick_best_deal(deals: Dict[str, Any], sent_asins: Set[str]) -> Optional[Dict[str, Any]]:
+    items = deals.get("dr") or []
+    for item in items:
+        asin = item.get("asin")
+        if asin and asin not in sent_asins:
+            return item
+
+    if items and items[0].get("asin"):
+        return items[0]
+    return None
+
+
+def extract_keepa_discount_percent(deal_item: Dict[str, Any]) -> Optional[float]:
+    for key in ("deltaPercent", "delta", "savingsPercent"):
+        value = deal_item.get(key)
+        if isinstance(value, (int, float)):
+            if value > 100:
+                value = value / 100.0
+            return float(value)
+    return None
+
+
+def build_caption(
+    title: str,
+    price: str,
+    old_price: Optional[str],
+    link: str,
+    discount_percent: Optional[float],
+) -> str:
+    badge = discount_badge(discount_percent)
+
+    if old_price:
+        price_line = "⭕{} anziché {}".format(price, old_price)
+    else:
+        price_line = "⭕{}".format(price)
+
+    discount_line = ""
+    if discount_percent is not None:
+        discount_line = "\n📉 Sconto: -{}%".format(str(discount_percent).replace(".", ","))
+
+    return "{}\n{}\n{}{}\n{}".format(
+        badge,
+        title,
+        price_line,
+        discount_line,
+        link,
+    )
+
 def pick_best_asin(deals: Dict[str, Any], sent_asins: Set[str]) -> Optional[str]:
     items = deals.get("dr") or []
     for item in items:
@@ -197,7 +321,6 @@ def pick_best_asin(deals: Dict[str, Any], sent_asins: Set[str]) -> Optional[str]
     if items and items[0].get("asin"):
         return items[0]["asin"]
     return None
-
 
 # ---------------- AUTO OFFERTE ----------------
 async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -213,7 +336,7 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
                 {
                     "domainId": 8,
                     "priceTypes": [0],
-                    "deltaPercentRange": [40, 90],
+                    "deltaPercentRange": [15, 90],
                 }
             ),
         )
@@ -223,15 +346,20 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         sent_asins = load_sent_asins(cfg.state_file)
-        asin = pick_best_asin(deals, sent_asins)
+        deal_item = pick_best_deal(deals, sent_asins)
 
-        if not asin:
+        if not deal_item:
             logger.info("Nessun ASIN valido trovato")
+            return
+
+        asin = deal_item.get("asin")
+        if not asin:
+            logger.info("Deal senza ASIN")
             return
 
         logger.info("ASIN selezionato: %s", asin)
 
-        title, price, image_url = await loop.run_in_executor(
+        title, price, old_price, image_url = await loop.run_in_executor(
             None, lambda: get_amazon_data(session, asin)
         )
 
@@ -239,8 +367,11 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.warning("Prezzo non trovato per %s", asin)
             return
 
+        keepa_discount = extract_keepa_discount_percent(deal_item)
+        discount_percent = compute_discount_percent(price, old_price, keepa_discount)
+
         link = "https://www.amazon.it/dp/{}?tag={}".format(asin, cfg.affiliate_tag)
-        caption = "🔥 {}\n\n💰 Prezzo: {}\n\n👉 {}".format(title, price, link)
+        caption = build_caption(title, price, old_price, link, discount_percent)
 
         sent = False
         if image_url:
