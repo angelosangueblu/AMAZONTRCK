@@ -311,6 +311,16 @@ def build_caption(
         link,
     )
 
+def pick_best_asin(deals: Dict[str, Any], sent_asins: Set[str]) -> Optional[str]:
+    items = deals.get("dr") or []
+    for item in items:
+        asin = item.get("asin")
+        if asin and asin not in sent_asins:
+            return asin
+
+    if items and items[0].get("asin"):
+        return items[0]["asin"]
+    return None
 
 # ---------------- AUTO OFFERTE ----------------
 async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
