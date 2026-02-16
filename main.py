@@ -287,6 +287,23 @@ def is_placeholder_title(title: str) -> bool:
     return normalized in {"", "offerta amazon", "galleria prodotti"}
 
 
+def is_low_quality_title(title: str) -> bool:
+    normalized = (title or "").strip().lower()
+    if is_placeholder_title(title):
+        return True
+
+    generic_markers = (
+        "amazon.it",
+        "acquista ora",
+        "scopri di più",
+        "offerta del giorno",
+    )
+    if any(marker in normalized for marker in generic_markers):
+        return True
+
+    return len(normalized) < 12
+
+
 def is_bad_image_url(image_url: Optional[str]) -> bool:
     if not image_url:
         return True
@@ -383,7 +400,7 @@ def get_amazon_data(
         tag = soup.select_one(selector)
         if tag:
             text = tag.get_text(strip=True)
-            if text and "€" in text:
+            if text and "€" in text and not is_unit_price_text(text):
                 price = text
                 break
 
@@ -751,7 +768,7 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
             keepa_title: Optional[str] = None
             keepa_image_url: Optional[str] = None
 
-            need_keepa_query = is_placeholder_title(title) or (not price) or is_bad_image_url(image_url)
+            need_keepa_query = is_low_quality_title(title) or (not price) or is_bad_image_url(image_url)
             if need_keepa_query and keepa_queries_done < cfg.max_keepa_queries_per_cycle:
                 try:
                     keepa_products = await loop.run_in_executor(None, lambda asin=asin: api.query(asin))
@@ -765,13 +782,17 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
             elif need_keepa_query:
                 logger.info("Budget query Keepa esaurito nel ciclo, skip enrich per %s", asin)
 
-            if is_placeholder_title(title) and keepa_title:
+            if is_low_quality_title(title) and keepa_title:
                 title = keepa_title
 
             if not price:
                 price = extract_price_from_keepa_product(product_payload) or extract_price_from_deal_item(deal_item)
                 if price:
                     logger.warning("Prezzo Amazon non trovato per %s, uso fallback Keepa: %s", asin, price)
+
+            if is_low_quality_title(title):
+                logger.info("Deal scartato (%s): titolo non affidabile", asin)
+                continue
 
             if not product_looks_eligible(product_payload, price):
                 logger.info("Deal scartato (%s): prezzo/metadata non validi", asin)
@@ -801,6 +822,12 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
             sent = False
             if is_bad_image_url(image_url) and keepa_image_url:
                 image_url = keepa_image_url
+
+            if is_bad_image_url(image_url):
+                logger.info("Deal scartato (%s): immagine non disponibile/valida", asin)
+                sent_asins.discard(asin)
+                save_sent_asins(cfg.state_file, trim_sent_asins(sent_asins))
+                continue
 
             try:
                 if image_url and not is_bad_image_url(image_url):
