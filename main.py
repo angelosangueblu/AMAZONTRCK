@@ -107,6 +107,15 @@ def resolve_state_path(path: str) -> str:
 
 
 # -------- STATO ASIN INVIATI --------
+def normalize_asin(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    asin = value.strip().upper()
+    if re.fullmatch(r"[A-Z0-9]{10}", asin):
+        return asin
+    return None
+
+
 def load_sent_asins(path: str) -> Set[str]:
     state_path = Path(resolve_state_path(path))
     if not state_path.exists():
@@ -114,8 +123,21 @@ def load_sent_asins(path: str) -> Set[str]:
 
     try:
         data = json.loads(state_path.read_text(encoding="utf-8"))
+        raw_asins: List[Any] = []
         if isinstance(data, list):
-            return set(str(x) for x in data)
+            raw_asins = data
+        elif isinstance(data, dict) and isinstance(data.get("sent_asins"), list):
+            raw_asins = data["sent_asins"]
+
+        deduped: List[str] = []
+        seen: Set[str] = set()
+        for item in raw_asins:
+            asin = normalize_asin(item)
+            if asin and asin not in seen:
+                deduped.append(asin)
+                seen.add(asin)
+
+        return set(deduped)
     except Exception as exc:
         logger.warning("Impossibile leggere lo stato ASIN: %s", exc)
 
@@ -123,8 +145,9 @@ def load_sent_asins(path: str) -> Set[str]:
 
 
 def save_sent_asins(path: str, asins: Set[str]) -> None:
-    Path(resolve_state_path(path)).write_text(
-        json.dumps(sorted(asins), ensure_ascii=False, indent=2),
+    cleaned = [asin for asin in sorted(asins) if normalize_asin(asin)]
+    Path(path).write_text(
+        json.dumps({"sent_asins": cleaned}, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
@@ -362,6 +385,57 @@ def sanitize_old_price(current_price: Optional[str], old_price: Optional[str]) -
     return format_eur(old)
 
 
+def is_placeholder_title(title: str) -> bool:
+    normalized = (title or "").strip().lower()
+    return normalized in {"", "offerta amazon", "galleria prodotti"}
+
+
+def is_bad_image_url(image_url: Optional[str]) -> bool:
+    if not image_url:
+        return True
+
+    lowered = image_url.lower()
+    # Evita immagini placeholder generiche (es. logo Prime) nei post.
+    bad_markers = (
+        "prime",
+        "nav-sprite",
+        "amazon-logo",
+        "icon",
+        "sprite",
+    )
+    return any(marker in lowered for marker in bad_markers)
+
+
+def normalize_image_url(image_url: Optional[str]) -> Optional[str]:
+    if not image_url:
+        return None
+
+    cleaned = image_url.replace("&amp;", "&")
+    # Rimuove i modificatori di resize aggressivi Amazon per evitare miniature/sfocatura.
+    cleaned = re.sub(r"\._[^.]+_\.", ".", cleaned)
+    cleaned = re.sub(r"\._[A-Z0-9,]+_", "", cleaned)
+    return cleaned
+
+
+def asin_in_url(url: Optional[str], asin: str) -> bool:
+    if not url:
+        return False
+    return asin.lower() in url.lower()
+
+
+def sanitize_old_price(current_price: Optional[str], old_price: Optional[str]) -> Optional[str]:
+    current = parse_price_to_float(current_price)
+    old = parse_price_to_float(old_price)
+
+    if current is None or old is None:
+        return None
+
+    if old <= current:
+        return None
+
+    return format_eur(old)
+
+
 # -------- PRENDI DATI AMAZON --------
 def get_amazon_data(
     session: requests.Session,
@@ -383,6 +457,16 @@ def get_amazon_data(
 
     title_tag = soup.select_one("#productTitle") or soup.select_one("h1.a-size-large")
     title = title_tag.get_text(strip=True) if title_tag else "Offerta Amazon"
+
+    canonical_href = None
+    canonical_tag = soup.select_one("link[rel='canonical']")
+    if canonical_tag:
+        canonical_href = canonical_tag.get("href")
+
+    og_url = None
+    og_url_tag = soup.select_one("meta[property='og:url']")
+    if og_url_tag:
+        og_url = og_url_tag.get("content")
 
     if is_placeholder_title(title):
         og_title = soup.select_one("meta[property='og:title']")
@@ -443,13 +527,25 @@ def get_amazon_data(
     if image_url and image_url.startswith("/"):
         image_url = "https://m.media-amazon.com" + image_url
 
+    image_url = normalize_image_url(image_url)
+
+    # Se Amazon reindirizza/mostra un ASIN differente, evita titolo/immagine incoerenti.
+    if not asin_in_url(canonical_href, asin) and not asin_in_url(og_url, asin):
+        logger.warning("Pagina Amazon non coerente per %s (canonical/og:url mismatch)", asin)
+        title = "Offerta Amazon"
+        image_url = None
+
     return title, price, old_price, image_url
 
 
 def download_image_bytes(session: requests.Session, url: str) -> Optional[BytesIO]:
     try:
-        response = session.get(url, timeout=(8, 20))
+        normalized = normalize_image_url(url)
+        response = session.get(normalized or url, timeout=(8, 20))
         response.raise_for_status()
+        if len(response.content) < 25_000:
+            logger.warning("Immagine troppo piccola, possibile miniatura (%s bytes)", len(response.content))
+            return None
         image_bytes = BytesIO(response.content)
         image_bytes.name = "prodotto.jpg"
         image_bytes.seek(0)
@@ -505,7 +601,9 @@ def enrich_from_keepa_product(product: Dict[str, Any]) -> Tuple[Optional[str], O
     if isinstance(images_csv, str) and images_csv.strip():
         first_image = images_csv.split(",")[0].strip()
         if first_image:
-            image_url = "https://images-na.ssl-images-amazon.com/images/I/{}".format(first_image)
+            image_url = normalize_image_url(
+                "https://images-na.ssl-images-amazon.com/images/I/{}".format(first_image)
+            )
 
     return title, image_url
 
@@ -622,6 +720,13 @@ def trim_sent_asins(sent_asins: Set[str], limit: int = 5000) -> Set[str]:
     return set(sorted(sent_asins)[-limit:])
 
 
+def select_matching_keepa_product(products: List[Dict[str, Any]], asin: str) -> Dict[str, Any]:
+    for product in products:
+        if normalize_asin(product.get("asin")) == asin:
+            return product
+    return products[0] if products else {}
+
+
 def fetch_keepa_deals(api: keepa.Keepa) -> Optional[Dict[str, Any]]:
     payload = {
         "domainId": 8,
@@ -670,7 +775,7 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
         scanned = 0
         keepa_queries_done = 0
         for deal_item in deal_items[: cfg.max_deals_per_cycle]:
-            asin = deal_item.get("asin")
+            asin = normalize_asin(deal_item.get("asin"))
             if not asin:
                 logger.info("Deal scartato: asin mancante")
                 continue
@@ -703,7 +808,7 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
                     logger.warning("Query Keepa fallita per %s: %s", asin, exc)
                     keepa_products = []
 
-                product_payload = keepa_products[0] if keepa_products else {}
+                product_payload = select_matching_keepa_product(keepa_products, asin)
                 keepa_title, keepa_image_url = enrich_from_keepa_product(product_payload)
             elif need_keepa_query:
                 logger.info("Budget query Keepa esaurito nel ciclo, skip enrich per %s", asin)
@@ -736,23 +841,32 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
             link = "https://www.amazon.it/dp/{}?tag={}".format(asin, cfg.affiliate_tag)
             caption = build_caption(title, price or "Prezzo non disponibile", old_price, link, discount_percent)
 
+            # Salva subito lo stato per evitare duplicati in caso di riavvio/crash
+            # subito dopo l'invio Telegram.
+            sent_asins.add(asin)
+            save_sent_asins(cfg.state_file, trim_sent_asins(sent_asins))
+
             sent = False
             if is_bad_image_url(image_url) and keepa_image_url:
                 image_url = keepa_image_url
 
-            if image_url and not is_bad_image_url(image_url):
-                image_bytes = await loop.run_in_executor(
-                    None, lambda image_url=image_url: download_image_bytes(session, image_url)
-                )
-                if image_bytes:
-                    await context.bot.send_photo(chat_id=cfg.channel_id, photo=image_bytes, caption=caption)
-                    sent = True
+            try:
+                if image_url and not is_bad_image_url(image_url):
+                    image_bytes = await loop.run_in_executor(
+                        None, lambda image_url=image_url: download_image_bytes(session, image_url)
+                    )
+                    if image_bytes:
+                        await context.bot.send_photo(chat_id=cfg.channel_id, photo=image_bytes, caption=caption)
+                        sent = True
 
-            if not sent:
-                await context.bot.send_message(chat_id=cfg.channel_id, text=caption)
+                if not sent:
+                    await context.bot.send_message(chat_id=cfg.channel_id, text=caption)
+            except Exception as exc:
+                sent_asins.discard(asin)
+                save_sent_asins(cfg.state_file, trim_sent_asins(sent_asins))
+                logger.warning("Invio Telegram fallito per %s: %s", asin, exc)
+                continue
 
-            sent_asins.add(asin)
-            save_sent_asins(cfg.state_file, trim_sent_asins(sent_asins))
             logger.info("Offerta inviata correttamente per %s", asin)
             return
 
