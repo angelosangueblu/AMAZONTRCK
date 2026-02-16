@@ -29,7 +29,7 @@ class Config:
     max_deals_per_cycle: int = 40
     max_keepa_queries_per_cycle: int = 8
     min_discount_percent: float = 10.0
-    state_file: str = "sent_asins.json"
+    state_file: str = "sent_asins_niche.json"
 
 
 def load_config() -> Config:
@@ -93,17 +93,70 @@ def setup_logging() -> None:
 
 
 setup_logging()
-logger = logging.getLogger("amazon_deals_bot")
+logger = logging.getLogger("amazon_deals_bot_niche")
 
 
-def resolve_state_path(path: str) -> str:
-    state_path = Path(path)
-    if state_path.is_absolute():
-        return str(state_path)
+TARGET_KEYWORDS_IT: Dict[str, Set[str]] = {
+    "informatica": {
+        "mouse", "tastiera", "usb", "hdmi", "router", "modem", "power bank", "powerbank",
+        "ssd", "hard disk", "hdd", "webcam", "micro sd", "scheda sd", "hub usb", "monitor",
+        "stampante", "cartuccia", "cuffie", "notebook", "laptop stand", "supporto notebook",
+    },
+    "cibo": {
+        "caffè", "capsule", "cialde", "pasta", "riso", "tonno", "olio", "biscotti", "snack",
+        "cioccolato", "proteine", "barretta", "the", "tè", "bevanda", "acqua", "integratore",
+    },
+    "casa": {
+        "aspirapolvere", "robot", "scopa", "detersivo", "padella", "pentola", "lampada",
+        "deumidificatore", "umidificatore", "contenitore", "organizer", "lenzuola", "cuscino",
+        "coperta", "stendibiancheria", "mocio", "anticalcare", "pulizia", "cucina",
+    },
+}
 
-    # Mantiene lo stato stabile anche dopo restart/cwd diversi
-    base_dir = Path(__file__).resolve().parent
-    return str(base_dir / state_path)
+
+def normalize_text(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    normalized = value.lower().replace("’", "'")
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized.strip()
+
+
+def extract_product_taxonomy_text(product_payload: Dict[str, Any]) -> str:
+    parts: List[str] = []
+    if not isinstance(product_payload, dict):
+        return ""
+
+    for key in ("title", "brand", "manufacturer"):
+        value = product_payload.get(key)
+        if isinstance(value, str):
+            parts.append(value)
+
+    category_tree = product_payload.get("categoryTree")
+    if isinstance(category_tree, list):
+        for node in category_tree:
+            if isinstance(node, dict):
+                name = node.get("name")
+                if isinstance(name, str):
+                    parts.append(name)
+
+    return normalize_text(" ".join(parts))
+
+
+def is_target_product(title: str, product_payload: Dict[str, Any]) -> Tuple[bool, str]:
+    combined = normalize_text(title)
+    taxonomy_text = extract_product_taxonomy_text(product_payload)
+    if taxonomy_text:
+        combined = f"{combined} {taxonomy_text}".strip()
+
+    if not combined:
+        return False, "testo prodotto assente"
+
+    for category, keywords in TARGET_KEYWORDS_IT.items():
+        if any(keyword in combined for keyword in keywords):
+            return True, category
+
+    return False, "fuori nicchia"
 
 
 # -------- STATO ASIN INVIATI --------
@@ -117,7 +170,7 @@ def normalize_asin(value: Any) -> Optional[str]:
 
 
 def load_sent_asins(path: str) -> Set[str]:
-    state_path = Path(resolve_state_path(path))
+    state_path = Path(path)
     if not state_path.exists():
         return set()
 
@@ -534,10 +587,11 @@ def build_caption(
     urgency_line = build_urgency_line(discount_percent)
 
     if old_price:
-        price_line = "🔴 Ora {} invece di {}".format(price, old_price)
+        price_line = "⭕{} anziché {}".format(price, old_price)
     else:
-        price_line = "🔴 Prezzo lampo: {}".format(price)
+        price_line = "⭕{}".format(price)
 
+    discount_line = ""
     if discount_percent is not None:
         discount_line = "\n📉 Sconto: -{}%".format(str(discount_percent).replace(".", ","))
 
@@ -790,6 +844,24 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
                 if price:
                     logger.warning("Prezzo Amazon non trovato per %s, uso fallback Keepa: %s", asin, price)
 
+            is_target, target_reason = is_target_product(title, product_payload)
+            if not is_target and not product_payload and keepa_queries_done < cfg.max_keepa_queries_per_cycle:
+                try:
+                    keepa_products = await loop.run_in_executor(None, lambda asin=asin: api.query(asin))
+                    keepa_queries_done += 1
+                    product_payload = select_matching_keepa_product(keepa_products, asin)
+                    keepa_title, keepa_image_url = enrich_from_keepa_product(product_payload)
+                    if is_low_quality_title(title) and keepa_title:
+                        title = keepa_title
+                except Exception as exc:
+                    logger.warning("Query Keepa extra (filtro nicchia) fallita per %s: %s", asin, exc)
+
+                is_target, target_reason = is_target_product(title, product_payload)
+
+            if not is_target:
+                logger.info("Deal scartato (%s): %s", asin, target_reason)
+                continue
+
             if is_low_quality_title(title):
                 logger.info("Deal scartato (%s): titolo non affidabile", asin)
                 continue
@@ -858,7 +930,7 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
 # ---------------- AVVIO ----------------
 def main() -> None:
     cfg = load_config()
-    logger.info("Avvio bot offerte Amazon")
+    logger.info("Avvio bot offerte Amazon (nicchie: informatica/casa/cibo)")
 
     app = ApplicationBuilder().token(cfg.bot_token).build()
     app.bot_data["config"] = cfg
