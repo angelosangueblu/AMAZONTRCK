@@ -27,7 +27,9 @@ class Config:
     interval_seconds: int = 180
     first_delay_seconds: int = 15
     max_deals_per_cycle: int = 40
-    max_keepa_queries_per_cycle: int = 30
+    max_keepa_queries_per_cycle: int = 8
+    keepa_query_timeout_seconds: float = 6.0
+    cycle_time_budget_seconds: int = 85
     max_alerts_per_cycle: int = 3
     min_discount_percent: float = 10.0
     state_file: str = "sent_asins.json"
@@ -64,7 +66,9 @@ def load_config() -> Config:
         interval_seconds=int(os.getenv("INTERVAL_SECONDS", "180")),
         first_delay_seconds=int(os.getenv("FIRST_DELAY_SECONDS", "15")),
         max_deals_per_cycle=int(os.getenv("MAX_DEALS_PER_CYCLE", "40")),
-        max_keepa_queries_per_cycle=int(os.getenv("MAX_KEEPA_QUERIES_PER_CYCLE", "30")),
+        max_keepa_queries_per_cycle=int(os.getenv("MAX_KEEPA_QUERIES_PER_CYCLE", "8")),
+        keepa_query_timeout_seconds=float(os.getenv("KEEPA_QUERY_TIMEOUT_SECONDS", "6")),
+        cycle_time_budget_seconds=int(os.getenv("CYCLE_TIME_BUDGET_SECONDS", "85")),
         max_alerts_per_cycle=int(os.getenv("MAX_ALERTS_PER_CYCLE", "3")),
         min_discount_percent=float(os.getenv("MIN_DISCOUNT_PERCENT", "10")),
         state_file=os.getenv("STATE_FILE", "sent_asins.json"),
@@ -772,6 +776,10 @@ def fetch_keepa_deals(api: keepa.Keepa) -> Optional[Dict[str, Any]]:
         logger.warning("Keepa deals non disponibile (tentativo 2): %s", exc)
         return None
 
+
+def cycle_time_exceeded(cycle_started_at: float, budget_seconds: int) -> bool:
+    return (asyncio.get_running_loop().time() - cycle_started_at) >= float(budget_seconds)
+
 # ---------------- AUTO OFFERTE ----------------
 async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
     loop = asyncio.get_running_loop()
@@ -795,7 +803,15 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
         scanned = 0
         keepa_queries_done = 0
         sent_count = 0
+        cycle_started_at = loop.time()
         for deal_item in deal_items[: cfg.max_deals_per_cycle]:
+            if cycle_time_exceeded(cycle_started_at, cfg.cycle_time_budget_seconds):
+                logger.info(
+                    "Budget tempo ciclo raggiunto (%ss), termino scan per mantenere costanza",
+                    cfg.cycle_time_budget_seconds,
+                )
+                break
+
             asin = normalize_asin(deal_item.get("asin"))
             if not asin:
                 logger.info("Deal scartato: asin mancante")
@@ -823,8 +839,18 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
             need_keepa_query = is_low_quality_title(title) or (not price)
             if need_keepa_query and keepa_queries_done < cfg.max_keepa_queries_per_cycle:
                 try:
-                    keepa_products = await loop.run_in_executor(None, lambda asin=asin: api.query(asin))
+                    keepa_products = await asyncio.wait_for(
+                        loop.run_in_executor(None, lambda asin=asin: api.query(asin)),
+                        timeout=cfg.keepa_query_timeout_seconds,
+                    )
                     keepa_queries_done += 1
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Query Keepa timeout per %s (>%ss), skip",
+                        asin,
+                        cfg.keepa_query_timeout_seconds,
+                    )
+                    keepa_products = []
                 except Exception as exc:
                     logger.warning("Query Keepa fallita per %s: %s", asin, exc)
                     keepa_products = []
