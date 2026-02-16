@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import keepa
 import requests
@@ -25,6 +25,9 @@ class Config:
     affiliate_tag: str
     interval_seconds: int = 300
     first_delay_seconds: int = 20
+    max_deals_per_cycle: int = 40
+    min_discount_percent: float = 30.0
+    super_discount_percent: float = 50.0
     state_file: str = "sent_asins.json"
 
 
@@ -92,9 +95,19 @@ setup_logging()
 logger = logging.getLogger("amazon_deals_bot")
 
 
+def resolve_state_path(path: str) -> str:
+    state_path = Path(path)
+    if state_path.is_absolute():
+        return str(state_path)
+
+    # Mantiene lo stato stabile anche dopo restart/cwd diversi
+    base_dir = Path(__file__).resolve().parent
+    return str(base_dir / state_path)
+
+
 # -------- STATO ASIN INVIATI --------
 def load_sent_asins(path: str) -> Set[str]:
-    state_path = Path(path)
+    state_path = Path(resolve_state_path(path))
     if not state_path.exists():
         return set()
 
@@ -109,7 +122,7 @@ def load_sent_asins(path: str) -> Set[str]:
 
 
 def save_sent_asins(path: str, asins: Set[str]) -> None:
-    Path(path).write_text(
+    Path(resolve_state_path(path)).write_text(
         json.dumps(sorted(asins), ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
@@ -142,6 +155,44 @@ def format_eur(value: float) -> str:
     return text.replace(".", ",") + "€"
 
 
+
+
+def keepa_cents_to_eur_text(value: Any) -> Optional[str]:
+    if not isinstance(value, (int, float)):
+        return None
+
+    if value <= 0:
+        return None
+
+    return format_eur(float(value) / 100.0)
+
+
+def extract_price_from_keepa_product(product: Dict[str, Any]) -> Optional[str]:
+    stats = product.get("stats") if isinstance(product, dict) else None
+    if not isinstance(stats, dict):
+        return None
+
+    # Priorità: buybox/current amazon/new
+    candidates: List[Any] = []
+    for key in ("buyBoxPrice", "current"):
+        value = stats.get(key)
+        if isinstance(value, (list, tuple)):
+            candidates.extend(list(value))
+        else:
+            candidates.append(value)
+
+    for candidate in candidates:
+        text = keepa_cents_to_eur_text(candidate)
+        if text:
+            return text
+
+    return None
+
+
+def has_valid_current_price(price_text: Optional[str]) -> bool:
+    value = parse_price_to_float(price_text)
+    return value is not None and value > 0
+
 def compute_discount_percent(current_price: Optional[str], old_price: Optional[str], fallback: Optional[float]) -> Optional[float]:
     current = parse_price_to_float(current_price)
     old = parse_price_to_float(old_price)
@@ -157,18 +208,55 @@ def compute_discount_percent(current_price: Optional[str], old_price: Optional[s
 
 def discount_badge(discount_percent: Optional[float]) -> str:
     if discount_percent is None:
-        return "💥 PREZZO INTERESSANTE"
+        return "🛍️ OFFERTA FLASH"
 
-    if discount_percent > 40:
-        return "❌ POSSIBILE ERRORE ❌"
+    if discount_percent >= 70:
+        return "🚨 MEGA BUG DI PREZZO? 🚨"
 
-    if 15 <= discount_percent <= 20:
-        return "💣 PREZZO BOMBA 💣"
+    if discount_percent >= 50:
+        return "💣 SCONTO PAZZESCO 💣"
 
-    if discount_percent < 15:
-        return "🔥 PREZZO AFFARE 🔥"
+    if discount_percent >= 40:
+        return "🔥 PREZZO BOMBA 🔥"
 
-    return "‼️ SUPER PREZZO ‼️"
+    if discount_percent >= 30:
+        return "✅ SUPER OFFERTA ✅"
+
+    return "✨ PREZZO SCONTATO ✨"
+
+
+def is_placeholder_title(title: str) -> bool:
+    normalized = (title or "").strip().lower()
+    return normalized in {"", "offerta amazon", "galleria prodotti"}
+
+
+def is_bad_image_url(image_url: Optional[str]) -> bool:
+    if not image_url:
+        return True
+
+    lowered = image_url.lower()
+    # Evita immagini placeholder generiche (es. logo Prime) nei post.
+    bad_markers = (
+        "prime",
+        "nav-sprite",
+        "amazon-logo",
+        "icon",
+        "sprite",
+    )
+    return any(marker in lowered for marker in bad_markers)
+
+
+def sanitize_old_price(current_price: Optional[str], old_price: Optional[str]) -> Optional[str]:
+    current = parse_price_to_float(current_price)
+    old = parse_price_to_float(old_price)
+
+    if current is None or old is None:
+        return None
+
+    if old <= current:
+        return None
+
+    return format_eur(old)
 
 
 # -------- PRENDI DATI AMAZON --------
@@ -192,6 +280,11 @@ def get_amazon_data(
 
     title_tag = soup.select_one("#productTitle") or soup.select_one("h1.a-size-large")
     title = title_tag.get_text(strip=True) if title_tag else "Offerta Amazon"
+
+    if is_placeholder_title(title):
+        og_title = soup.select_one("meta[property='og:title']")
+        if og_title and og_title.get("content"):
+            title = og_title.get("content").strip()
 
     price = None
     current_price_selectors = [
@@ -285,6 +378,67 @@ def extract_keepa_discount_percent(deal_item: Dict[str, Any]) -> Optional[float]
     return None
 
 
+def extract_price_from_deal_item(deal_item: Dict[str, Any]) -> Optional[str]:
+    for key in ("current", "currentPrice", "price"):
+        value = deal_item.get(key)
+
+        if isinstance(value, (list, tuple)) and value:
+            value = value[0]
+
+        text = keepa_cents_to_eur_text(value)
+        if text:
+            return text
+
+    return None
+
+
+def enrich_from_keepa_product(product: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    title = product.get("title") if isinstance(product, dict) else None
+
+    image_url = None
+    images_csv = product.get("imagesCSV") if isinstance(product, dict) else None
+    if isinstance(images_csv, str) and images_csv.strip():
+        first_image = images_csv.split(",")[0].strip()
+        if first_image:
+            image_url = "https://images-na.ssl-images-amazon.com/images/I/{}".format(first_image)
+
+    return title, image_url
+
+
+
+
+def sanitize_title_for_caption(title: str, max_len: int = 120) -> str:
+    clean = re.sub(r"\s+", " ", (title or "Offerta Amazon")).strip()
+    if len(clean) <= max_len:
+        return clean
+    return clean[: max_len - 1].rstrip() + "…"
+
+
+def is_discount_eligible(discount_percent: Optional[float], min_discount_percent: float) -> bool:
+    if discount_percent is None:
+        return False
+    return discount_percent >= min_discount_percent
+
+
+def deal_sort_key(deal_item: Dict[str, Any]) -> float:
+    score = extract_keepa_discount_percent(deal_item)
+    if score is None:
+        return -1.0
+    return float(score)
+
+
+def build_marketing_cta(discount_percent: Optional[float]) -> str:
+    if discount_percent is None:
+        return "👉 Apri ora l'offerta e verifica la disponibilità."
+
+    if discount_percent >= 50:
+        return "⚡ Sconto rarissimo: prendilo prima che finisca!"
+
+    if discount_percent >= 40:
+        return "🏃 Ottimo prezzo: aggiungilo subito al carrello!"
+
+    return "🛒 Offerta valida: controlla subito il prezzo live."
+
 def build_caption(
     title: str,
     price: str,
@@ -293,23 +447,21 @@ def build_caption(
     discount_percent: Optional[float],
 ) -> str:
     badge = discount_badge(discount_percent)
+    title_line = sanitize_title_for_caption(title)
 
     if old_price:
-        price_line = "⭕{} anziché {}".format(price, old_price)
+        price_line = "🔴 Ora {} invece di {}".format(price, old_price)
     else:
-        price_line = "⭕{}".format(price)
+        price_line = "🔴 Prezzo lampo: {}".format(price)
 
-    discount_line = ""
     if discount_percent is not None:
-        discount_line = "\n📉 Sconto: -{}%".format(str(discount_percent).replace(".", ","))
+        discount_line = "📉 Risparmio: -{}%".format(str(discount_percent).replace(".", ","))
+    else:
+        discount_line = "📉 Sconto: in aggiornamento"
 
-    return "{}\n{}\n{}{}\n{}".format(
-        badge,
-        title,
-        price_line,
-        discount_line,
-        link,
-    )
+    cta_line = build_marketing_cta(discount_percent)
+    return "\n".join([badge, title_line, price_line, discount_line, cta_line, link])
+
 
 def pick_best_asin(deals: Dict[str, Any], sent_asins: Set[str]) -> Optional[str]:
     items = deals.get("dr") or []
@@ -321,6 +473,24 @@ def pick_best_asin(deals: Dict[str, Any], sent_asins: Set[str]) -> Optional[str]
     if items and items[0].get("asin"):
         return items[0]["asin"]
     return None
+
+
+def product_looks_eligible(product_payload: Dict[str, Any], price: Optional[str]) -> bool:
+    if not has_valid_current_price(price):
+        return False
+
+    root_category = product_payload.get("rootCategory")
+    if isinstance(root_category, int) and root_category <= 0:
+        return False
+
+    return True
+
+
+def trim_sent_asins(sent_asins: Set[str], limit: int = 5000) -> Set[str]:
+    if len(sent_asins) <= limit:
+        return sent_asins
+
+    return set(sorted(sent_asins)[-limit:])
 
 # ---------------- AUTO OFFERTE ----------------
 async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -336,7 +506,7 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
                 {
                     "domainId": 8,
                     "priceTypes": [0],
-                    "deltaPercentRange": [15, 90],
+                    "deltaPercentRange": [25, 90],
                 }
             ),
         )
@@ -346,52 +516,92 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         sent_asins = load_sent_asins(cfg.state_file)
-        deal_item = pick_best_deal(deals, sent_asins)
-
-        if not deal_item:
-            logger.info("Nessun ASIN valido trovato")
+        deal_items = deals.get("dr") or []
+        deal_items = sorted(deal_items, key=deal_sort_key, reverse=True)
+        if not deal_items:
+            logger.info("Keepa ha restituito lista offerte vuota")
             return
 
-        asin = deal_item.get("asin")
-        if not asin:
-            logger.info("Deal senza ASIN")
-            return
+        scanned = 0
+        for deal_item in deal_items[: cfg.max_deals_per_cycle]:
+            asin = deal_item.get("asin")
+            if not asin:
+                logger.info("Deal scartato: asin mancante")
+                continue
 
-        logger.info("ASIN selezionato: %s", asin)
+            if asin in sent_asins:
+                logger.debug("Deal scartato (%s): già inviato", asin)
+                continue
 
-        title, price, old_price, image_url = await loop.run_in_executor(
-            None, lambda: get_amazon_data(session, asin)
-        )
+            scanned += 1
+            logger.info("Analizzo ASIN %s (%s/%s)", asin, scanned, cfg.max_deals_per_cycle)
 
-        if not price:
-            logger.warning("Prezzo non trovato per %s", asin)
-            return
-
-        keepa_discount = extract_keepa_discount_percent(deal_item)
-        discount_percent = compute_discount_percent(price, old_price, keepa_discount)
-
-        link = "https://www.amazon.it/dp/{}?tag={}".format(asin, cfg.affiliate_tag)
-        caption = build_caption(title, price, old_price, link, discount_percent)
-
-        sent = False
-        if image_url:
-            image_bytes = await loop.run_in_executor(
-                None, lambda: download_image_bytes(session, image_url)
-            )
-            if image_bytes:
-                await context.bot.send_photo(
-                    chat_id=cfg.channel_id,
-                    photo=image_bytes,
-                    caption=caption,
+            try:
+                title, price, old_price, image_url = await loop.run_in_executor(
+                    None, lambda asin=asin: get_amazon_data(session, asin)
                 )
-                sent = True
+            except Exception as exc:
+                logger.warning("Scraping Amazon fallito per %s: %s", asin, exc)
+                title, price, old_price, image_url = "Offerta Amazon", None, None, None
 
-        if not sent:
-            await context.bot.send_message(chat_id=cfg.channel_id, text=caption)
+            try:
+                keepa_products = await loop.run_in_executor(None, lambda asin=asin: api.query(asin))
+            except Exception as exc:
+                logger.warning("Query Keepa fallita per %s: %s", asin, exc)
+                keepa_products = []
 
-        sent_asins.add(asin)
-        save_sent_asins(cfg.state_file, sent_asins)
-        logger.info("Offerta inviata correttamente")
+            product_payload = keepa_products[0] if keepa_products else {}
+            keepa_title, keepa_image_url = enrich_from_keepa_product(product_payload)
+
+            if is_placeholder_title(title) and keepa_title:
+                title = keepa_title
+
+            if not price:
+                price = extract_price_from_keepa_product(product_payload) or extract_price_from_deal_item(deal_item)
+                if price:
+                    logger.warning("Prezzo Amazon non trovato per %s, uso fallback Keepa: %s", asin, price)
+
+            if not product_looks_eligible(product_payload, price):
+                logger.info("Deal scartato (%s): prezzo/metadata non validi", asin)
+                continue
+
+            keepa_discount = extract_keepa_discount_percent(deal_item)
+            old_price = sanitize_old_price(price, old_price)
+            discount_percent = compute_discount_percent(price, old_price, keepa_discount)
+
+            if not is_discount_eligible(discount_percent, cfg.min_discount_percent):
+                logger.info(
+                    "Deal scartato (%s): sconto %.1f%% sotto soglia %.1f%%",
+                    asin,
+                    discount_percent if discount_percent is not None else -1.0,
+                    cfg.min_discount_percent,
+                )
+                continue
+
+            link = "https://www.amazon.it/dp/{}?tag={}".format(asin, cfg.affiliate_tag)
+            caption = build_caption(title, price or "Prezzo non disponibile", old_price, link, discount_percent)
+
+            sent = False
+            if is_bad_image_url(image_url) and keepa_image_url:
+                image_url = keepa_image_url
+
+            if image_url and not is_bad_image_url(image_url):
+                image_bytes = await loop.run_in_executor(
+                    None, lambda image_url=image_url: download_image_bytes(session, image_url)
+                )
+                if image_bytes:
+                    await context.bot.send_photo(chat_id=cfg.channel_id, photo=image_bytes, caption=caption)
+                    sent = True
+
+            if not sent:
+                await context.bot.send_message(chat_id=cfg.channel_id, text=caption)
+
+            sent_asins.add(asin)
+            save_sent_asins(cfg.state_file, trim_sent_asins(sent_asins))
+            logger.info("Offerta inviata correttamente per %s", asin)
+            return
+
+        logger.info("Nessuna offerta idonea inviata in questo ciclo (analizzati: %s, soglia sconto: %.1f%%)", scanned, cfg.min_discount_percent)
 
     except Exception:
         logger.exception("Errore durante l'invio offerta")
