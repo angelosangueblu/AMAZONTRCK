@@ -24,13 +24,12 @@ class Config:
     keepa_key: str
     channel_id: int
     affiliate_tag: str
-    interval_seconds: int = 180
-    first_delay_seconds: int = 15
+    interval_seconds: int = 300
+    first_delay_seconds: int = 20
     max_deals_per_cycle: int = 40
-    max_keepa_queries_per_cycle: int = 30
-    max_alerts_per_cycle: int = 3
+    max_keepa_queries_per_cycle: int = 8
     min_discount_percent: float = 10.0
-    state_file: str = "sent_asins.json"
+    state_file: str = "sent_asins_niche.json"
 
 
 def load_config() -> Config:
@@ -61,13 +60,6 @@ def load_config() -> Config:
         keepa_key=keepa_key,
         channel_id=int(channel_id),
         affiliate_tag=affiliate_tag,
-        interval_seconds=int(os.getenv("INTERVAL_SECONDS", "180")),
-        first_delay_seconds=int(os.getenv("FIRST_DELAY_SECONDS", "15")),
-        max_deals_per_cycle=int(os.getenv("MAX_DEALS_PER_CYCLE", "40")),
-        max_keepa_queries_per_cycle=int(os.getenv("MAX_KEEPA_QUERIES_PER_CYCLE", "30")),
-        max_alerts_per_cycle=int(os.getenv("MAX_ALERTS_PER_CYCLE", "3")),
-        min_discount_percent=float(os.getenv("MIN_DISCOUNT_PERCENT", "10")),
-        state_file=os.getenv("STATE_FILE", "sent_asins.json"),
     )
 
 
@@ -101,17 +93,70 @@ def setup_logging() -> None:
 
 
 setup_logging()
-logger = logging.getLogger("amazon_deals_bot")
+logger = logging.getLogger("amazon_deals_bot_niche")
 
 
-def resolve_state_path(path: str) -> str:
-    state_path = Path(path)
-    if state_path.is_absolute():
-        return str(state_path)
+TARGET_KEYWORDS_IT: Dict[str, Set[str]] = {
+    "informatica": {
+        "mouse", "tastiera", "usb", "hdmi", "router", "modem", "power bank", "powerbank",
+        "ssd", "hard disk", "hdd", "webcam", "micro sd", "scheda sd", "hub usb", "monitor",
+        "stampante", "cartuccia", "cuffie", "notebook", "laptop stand", "supporto notebook",
+    },
+    "cibo": {
+        "caffè", "capsule", "cialde", "pasta", "riso", "tonno", "olio", "biscotti", "snack",
+        "cioccolato", "proteine", "barretta", "the", "tè", "bevanda", "acqua", "integratore",
+    },
+    "casa": {
+        "aspirapolvere", "robot", "scopa", "detersivo", "padella", "pentola", "lampada",
+        "deumidificatore", "umidificatore", "contenitore", "organizer", "lenzuola", "cuscino",
+        "coperta", "stendibiancheria", "mocio", "anticalcare", "pulizia", "cucina",
+    },
+}
 
-    # Mantiene lo stato stabile anche dopo restart/cwd diversi
-    base_dir = Path(__file__).resolve().parent
-    return str(base_dir / state_path)
+
+def normalize_text(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    normalized = value.lower().replace("’", "'")
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized.strip()
+
+
+def extract_product_taxonomy_text(product_payload: Dict[str, Any]) -> str:
+    parts: List[str] = []
+    if not isinstance(product_payload, dict):
+        return ""
+
+    for key in ("title", "brand", "manufacturer"):
+        value = product_payload.get(key)
+        if isinstance(value, str):
+            parts.append(value)
+
+    category_tree = product_payload.get("categoryTree")
+    if isinstance(category_tree, list):
+        for node in category_tree:
+            if isinstance(node, dict):
+                name = node.get("name")
+                if isinstance(name, str):
+                    parts.append(name)
+
+    return normalize_text(" ".join(parts))
+
+
+def is_target_product(title: str, product_payload: Dict[str, Any]) -> Tuple[bool, str]:
+    combined = normalize_text(title)
+    taxonomy_text = extract_product_taxonomy_text(product_payload)
+    if taxonomy_text:
+        combined = f"{combined} {taxonomy_text}".strip()
+
+    if not combined:
+        return False, "testo prodotto assente"
+
+    for category, keywords in TARGET_KEYWORDS_IT.items():
+        if any(keyword in combined for keyword in keywords):
+            return True, category
+
+    return False, "fuori nicchia"
 
 
 # -------- STATO ASIN INVIATI --------
@@ -125,7 +170,7 @@ def normalize_asin(value: Any) -> Optional[str]:
 
 
 def load_sent_asins(path: str) -> Set[str]:
-    state_path = Path(resolve_state_path(path))
+    state_path = Path(path)
     if not state_path.exists():
         return set()
 
@@ -490,57 +535,14 @@ def pick_best_deal(deals: Dict[str, Any], sent_asins: Set[str]) -> Optional[Dict
 
 
 def extract_keepa_discount_percent(deal_item: Dict[str, Any]) -> Optional[float]:
-    for key in ("deltaPercent", "delta", "savingsPercent", "dealPercent"):
+    for key in ("deltaPercent", "delta", "savingsPercent"):
         value = deal_item.get(key)
-        if not isinstance(value, (int, float)):
-            continue
-
-        value = abs(float(value))
-        if value == 0:
-            continue
-
-        # Keepa può restituire scale diverse (es: 1500 => 15.00%).
-        if value > 1000:
-            value = value / 100.0
-        elif value > 100:
-            value = value / 10.0
-
-        if value <= 0:
-            continue
-
-        return round(value, 1)
-
-    return None
-
-
-def extract_discount_from_keepa_product_stats(product: Dict[str, Any], current_price_text: Optional[str]) -> Optional[float]:
-    current = parse_price_to_float(current_price_text)
-    if current is None or current <= 0:
-        return None
-
-    stats = product.get("stats") if isinstance(product, dict) else None
-    if not isinstance(stats, dict):
-        return None
-
-    # Preferiamo medie recenti per avere uno sconto realistico.
-    for key in ("avg30", "avg90", "avg180"):
-        value = stats.get(key)
-        baseline_cents = value[1] if isinstance(value, (list, tuple)) and len(value) > 1 else value
-        baseline = keepa_cents_to_eur_text(baseline_cents)
-        baseline_value = parse_price_to_float(baseline)
-        if baseline_value is None or baseline_value <= current:
-            continue
-
-        return round(((baseline_value - current) / baseline_value) * 100.0, 1)
-
-    return None
-
-
-def extract_title_from_deal_item(deal_item: Dict[str, Any]) -> Optional[str]:
-    for key in ("title", "productTitle", "name"):
-        value = deal_item.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
+        if isinstance(value, (int, float)):
+            if value > 100:
+                value = value / 100.0
+            if value <= 0:
+                return None
+            return float(value)
     return None
 
 
@@ -585,10 +587,11 @@ def build_caption(
     urgency_line = build_urgency_line(discount_percent)
 
     if old_price:
-        price_line = "🔴 Ora {} invece di {}".format(price, old_price)
+        price_line = "⭕{} anziché {}".format(price, old_price)
     else:
-        price_line = "🔴 Prezzo lampo: {}".format(price)
+        price_line = "⭕{}".format(price)
 
+    discount_line = ""
     if discount_percent is not None:
         discount_line = "\n📉 Sconto: -{}%".format(str(discount_percent).replace(".", ","))
 
@@ -794,7 +797,6 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         scanned = 0
         keepa_queries_done = 0
-        sent_count = 0
         for deal_item in deal_items[: cfg.max_deals_per_cycle]:
             asin = normalize_asin(deal_item.get("asin"))
             if not asin:
@@ -820,7 +822,7 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
             keepa_title: Optional[str] = None
             keepa_image_url: Optional[str] = None
 
-            need_keepa_query = is_low_quality_title(title) or (not price)
+            need_keepa_query = is_low_quality_title(title) or (not price) or is_bad_image_url(image_url)
             if need_keepa_query and keepa_queries_done < cfg.max_keepa_queries_per_cycle:
                 try:
                     keepa_products = await loop.run_in_executor(None, lambda asin=asin: api.query(asin))
@@ -842,10 +844,23 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
                 if price:
                     logger.warning("Prezzo Amazon non trovato per %s, uso fallback Keepa: %s", asin, price)
 
-            if is_low_quality_title(title):
-                fallback_title = extract_title_from_deal_item(deal_item)
-                if fallback_title and not is_low_quality_title(fallback_title):
-                    title = fallback_title
+            is_target, target_reason = is_target_product(title, product_payload)
+            if not is_target and not product_payload and keepa_queries_done < cfg.max_keepa_queries_per_cycle:
+                try:
+                    keepa_products = await loop.run_in_executor(None, lambda asin=asin: api.query(asin))
+                    keepa_queries_done += 1
+                    product_payload = select_matching_keepa_product(keepa_products, asin)
+                    keepa_title, keepa_image_url = enrich_from_keepa_product(product_payload)
+                    if is_low_quality_title(title) and keepa_title:
+                        title = keepa_title
+                except Exception as exc:
+                    logger.warning("Query Keepa extra (filtro nicchia) fallita per %s: %s", asin, exc)
+
+                is_target, target_reason = is_target_product(title, product_payload)
+
+            if not is_target:
+                logger.info("Deal scartato (%s): %s", asin, target_reason)
+                continue
 
             if is_low_quality_title(title):
                 logger.info("Deal scartato (%s): titolo non affidabile", asin)
@@ -857,12 +872,7 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
 
             keepa_discount = extract_keepa_discount_percent(deal_item)
             old_price = sanitize_old_price(price, old_price)
-
-            stats_discount = None
-            if keepa_discount is None:
-                stats_discount = extract_discount_from_keepa_product_stats(product_payload, price)
-
-            discount_percent = compute_discount_percent(price, old_price, keepa_discount or stats_discount)
+            discount_percent = compute_discount_percent(price, old_price, keepa_discount)
 
             if not discount_is_eligible(discount_percent, cfg.min_discount_percent):
                 logger.info(
@@ -908,27 +918,10 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
                 logger.warning("Invio Telegram fallito per %s: %s", asin, exc)
                 continue
 
-            sent_count += 1
-            logger.info(
-                "Offerta inviata correttamente per %s (%s/%s nel ciclo)",
-                asin,
-                sent_count,
-                cfg.max_alerts_per_cycle,
-            )
+            logger.info("Offerta inviata correttamente per %s", asin)
+            return
 
-            if sent_count >= cfg.max_alerts_per_cycle:
-                logger.info("Raggiunto limite invii ciclo: %s", cfg.max_alerts_per_cycle)
-                return
-
-        if sent_count == 0:
-            logger.info("Nessuna offerta idonea inviata in questo ciclo (analizzati: %s, query_keepa: %s)", scanned, keepa_queries_done)
-        else:
-            logger.info(
-                "Ciclo completato: %s offerte inviate (analizzati: %s, query_keepa: %s)",
-                sent_count,
-                scanned,
-                keepa_queries_done,
-            )
+        logger.info("Nessuna offerta idonea inviata in questo ciclo (analizzati: %s, query_keepa: %s)", scanned, keepa_queries_done)
 
     except Exception:
         logger.exception("Errore durante l'invio offerta")
@@ -937,7 +930,7 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
 # ---------------- AVVIO ----------------
 def main() -> None:
     cfg = load_config()
-    logger.info("Avvio bot offerte Amazon")
+    logger.info("Avvio bot offerte Amazon (nicchie: informatica/casa/cibo)")
 
     app = ApplicationBuilder().token(cfg.bot_token).build()
     app.bot_data["config"] = cfg
