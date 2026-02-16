@@ -26,6 +26,8 @@ class Config:
     interval_seconds: int = 300
     first_delay_seconds: int = 20
     max_deals_per_cycle: int = 40
+    min_discount_percent: float = 30.0
+    super_discount_percent: float = 50.0
     state_file: str = "sent_asins.json"
 
 
@@ -93,9 +95,19 @@ setup_logging()
 logger = logging.getLogger("amazon_deals_bot")
 
 
+def resolve_state_path(path: str) -> str:
+    state_path = Path(path)
+    if state_path.is_absolute():
+        return str(state_path)
+
+    # Mantiene lo stato stabile anche dopo restart/cwd diversi
+    base_dir = Path(__file__).resolve().parent
+    return str(base_dir / state_path)
+
+
 # -------- STATO ASIN INVIATI --------
 def load_sent_asins(path: str) -> Set[str]:
-    state_path = Path(path)
+    state_path = Path(resolve_state_path(path))
     if not state_path.exists():
         return set()
 
@@ -110,7 +122,7 @@ def load_sent_asins(path: str) -> Set[str]:
 
 
 def save_sent_asins(path: str, asins: Set[str]) -> None:
-    Path(path).write_text(
+    Path(resolve_state_path(path)).write_text(
         json.dumps(sorted(asins), ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
@@ -195,19 +207,56 @@ def compute_discount_percent(current_price: Optional[str], old_price: Optional[s
 
 
 def discount_badge(discount_percent: Optional[float]) -> str:
-    if discount_percent is None:
-        return "💥 PREZZO INTERESSANTE"
+    if discount_percent >= 15:
+        return "🛍️ OFFERTA FLASH🛍️"
 
-    if discount_percent > 40:
-        return "❌ POSSIBILE ERRORE ❌"
+    if discount_percent >= 70:
+        return "🚨 ERRORE DI PREZZO 🚨"
 
-    if 15 <= discount_percent <= 20:
-        return "💣 PREZZO BOMBA 💣"
+    if discount_percent >= 50:
+        return "💣 SCONTO PAZZESCO 💣"
 
-    if discount_percent < 15:
-        return "🔥 PREZZO AFFARE 🔥"
+    if discount_percent >= 40:
+        return "🔥 PREZZO BOMBA 🔥"
 
-    return "‼️ SUPER PREZZO ‼️"
+    if discount_percent >= 30:
+        return "✅ SUPER OFFERTA ✅"
+
+    return "✨ PREZZO SCONTATO ✨"
+
+
+def is_placeholder_title(title: str) -> bool:
+    normalized = (title or "").strip().lower()
+    return normalized in {"", "offerta amazon", "galleria prodotti"}
+
+
+def is_bad_image_url(image_url: Optional[str]) -> bool:
+    if not image_url:
+        return True
+
+    lowered = image_url.lower()
+    # Evita immagini placeholder generiche (es. logo Prime) nei post.
+    bad_markers = (
+        "prime",
+        "nav-sprite",
+        "amazon-logo",
+        "icon",
+        "sprite",
+    )
+    return any(marker in lowered for marker in bad_markers)
+
+
+def sanitize_old_price(current_price: Optional[str], old_price: Optional[str]) -> Optional[str]:
+    current = parse_price_to_float(current_price)
+    old = parse_price_to_float(old_price)
+
+    if current is None or old is None:
+        return None
+
+    if old <= current:
+        return None
+
+    return format_eur(old)
 
 
 def is_placeholder_title(title: str) -> bool:
@@ -390,6 +439,40 @@ def enrich_from_keepa_product(product: Dict[str, Any]) -> Tuple[Optional[str], O
     return title, image_url
 
 
+
+
+def sanitize_title_for_caption(title: str, max_len: int = 120) -> str:
+    clean = re.sub(r"\s+", " ", (title or "Offerta Amazon")).strip()
+    if len(clean) <= max_len:
+        return clean
+    return clean[: max_len - 1].rstrip() + "…"
+
+
+def is_discount_eligible(discount_percent: Optional[float], min_discount_percent: float) -> bool:
+    if discount_percent is None:
+        return False
+    return discount_percent >= min_discount_percent
+
+
+def deal_sort_key(deal_item: Dict[str, Any]) -> float:
+    score = extract_keepa_discount_percent(deal_item)
+    if score is None:
+        return -1.0
+    return float(score)
+
+
+def build_marketing_cta(discount_percent: Optional[float]) -> str:
+    if discount_percent is None:
+        return "👉 Apri ora l'offerta e verifica la disponibilità."
+
+    if discount_percent >= 50:
+        return "⚡ Sconto rarissimo: prendilo prima che finisca!"
+
+    if discount_percent >= 40:
+        return "🏃 Ottimo prezzo: aggiungilo subito al carrello!"
+
+    return "🛒 Offerta valida: controlla subito il prezzo live."
+
 def build_caption(
     title: str,
     price: str,
@@ -398,23 +481,21 @@ def build_caption(
     discount_percent: Optional[float],
 ) -> str:
     badge = discount_badge(discount_percent)
+    title_line = sanitize_title_for_caption(title)
 
     if old_price:
-        price_line = "⭕{} anziché {}".format(price, old_price)
+        price_line = "🔴 Ora {} invece di {}".format(price, old_price)
     else:
-        price_line = "⭕{}".format(price)
+        price_line = "🔴 Prezzo lampo: {}".format(price)
 
-    discount_line = ""
     if discount_percent is not None:
-        discount_line = "\n📉 Sconto: -{}%".format(str(discount_percent).replace(".", ","))
+        discount_line = "📉 Risparmio: -{}%".format(str(discount_percent).replace(".", ","))
+    else:
+        discount_line = "📉 Sconto: in aggiornamento"
 
-    return "{}\n{}\n{}{}\n{}".format(
-        badge,
-        title,
-        price_line,
-        discount_line,
-        link,
-    )
+    cta_line = build_marketing_cta(discount_percent)
+    return "\n".join([badge, title_line, price_line, discount_line, cta_line, link])
+
 
 def pick_best_asin(deals: Dict[str, Any], sent_asins: Set[str]) -> Optional[str]:
     items = deals.get("dr") or []
@@ -426,7 +507,6 @@ def pick_best_asin(deals: Dict[str, Any], sent_asins: Set[str]) -> Optional[str]
     if items and items[0].get("asin"):
         return items[0]["asin"]
     return None
-
 
 
 def product_looks_eligible(product_payload: Dict[str, Any], price: Optional[str]) -> bool:
@@ -460,7 +540,7 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
                 {
                     "domainId": 8,
                     "priceTypes": [0],
-                    "deltaPercentRange": [15, 90],
+                    "deltaPercentRange": [25, 90],
                 }
             ),
         )
@@ -471,6 +551,7 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         sent_asins = load_sent_asins(cfg.state_file)
         deal_items = deals.get("dr") or []
+        deal_items = sorted(deal_items, key=deal_sort_key, reverse=True)
         if not deal_items:
             logger.info("Keepa ha restituito lista offerte vuota")
             return
@@ -522,6 +603,15 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
             old_price = sanitize_old_price(price, old_price)
             discount_percent = compute_discount_percent(price, old_price, keepa_discount)
 
+            if not is_discount_eligible(discount_percent, cfg.min_discount_percent):
+                logger.info(
+                    "Deal scartato (%s): sconto %.1f%% sotto soglia %.1f%%",
+                    asin,
+                    discount_percent if discount_percent is not None else -1.0,
+                    cfg.min_discount_percent,
+                )
+                continue
+
             link = "https://www.amazon.it/dp/{}?tag={}".format(asin, cfg.affiliate_tag)
             caption = build_caption(title, price or "Prezzo non disponibile", old_price, link, discount_percent)
 
@@ -545,7 +635,7 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.info("Offerta inviata correttamente per %s", asin)
             return
 
-        logger.info("Nessuna offerta idonea inviata in questo ciclo (analizzati: %s)", scanned)
+        logger.info("Nessuna offerta idonea inviata in questo ciclo (analizzati: %s, soglia sconto: %.1f%%)", scanned, cfg.min_discount_percent)
 
     except Exception:
         logger.exception("Errore durante l'invio offerta")
