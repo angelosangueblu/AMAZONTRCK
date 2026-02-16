@@ -152,14 +152,33 @@ def save_sent_asins(path: str, asins: Set[str]) -> None:
     )
 
 
+def is_unit_price_text(text: Optional[str]) -> bool:
+    if not text:
+        return False
+
+    normalized = text.lower().replace(" ", "")
+    return bool(
+        re.search(r"/(kg|g|gr|l|ml|cl|m|cm|mq|pz|unità)", normalized)
+        or re.search(r"al(kg|l)", normalized)
+    )
+
+
 def parse_price_to_float(price_text: Optional[str]) -> Optional[float]:
     if not price_text:
         return None
 
+    # Rimuove parti come "(96,60€ /kg)" che non rappresentano il prezzo totale.
+    without_unit_parts = re.sub(
+        r"\([^)]*(?:/(?:kg|g|gr|l|ml|cl|m|cm|mq|pz|unità)|al\s*(?:kg|l))[^)]*\)",
+        "",
+        price_text,
+        flags=re.IGNORECASE,
+    )
+
     normalized = (
-        price_text.replace("€", "")
+        without_unit_parts.replace("€", "")
         .replace("EUR", "")
-        .replace("\xa0", " ")
+        .replace(" ", " ")
         .strip()
     )
 
@@ -167,12 +186,12 @@ def parse_price_to_float(price_text: Optional[str]) -> Optional[float]:
     if not matches:
         return None
 
-    number = matches[-1].replace(".", "").replace(",", ".")
+    # Il primo importo è il prezzo prodotto; gli altri spesso sono quantità/unità.
+    number = matches[0].replace(".", "").replace(",", ".")
     try:
         return float(number)
     except ValueError:
         return None
-
 
 def format_eur(value: float) -> str:
     text = "{:.2f}".format(value)
@@ -230,159 +249,37 @@ def compute_discount_percent(current_price: Optional[str], old_price: Optional[s
     return None
 
 
-def discount_badge(discount_percent: Optional[float]) -> str:
-    if discount_percent >= 15:
-        return "🛍️ OFFERTA FLASH🛍️"
-
+def discount_tier(discount_percent: Optional[float]) -> str:
+    if discount_percent is None:
+        return "unknown"
     if discount_percent >= 70:
-        return "🚨 ERRORE DI PREZZO 🚨"
-
+        return "error_price"
     if discount_percent >= 50:
-        return "💣 SCONTO PAZZESCO 💣"
-
-    if discount_percent >= 40:
-        return "🔥 PREZZO BOMBA 🔥"
-
-    if discount_percent >= 30:
-        return "✅ SUPER OFFERTA ✅"
-
-    return "✨ PREZZO SCONTATO ✨"
-
-
-def is_placeholder_title(title: str) -> bool:
-    normalized = (title or "").strip().lower()
-    return normalized in {"", "offerta amazon", "galleria prodotti"}
+        return "bomba"
+    if discount_percent >= 35:
+        return "flash"
+    if discount_percent >= 25:
+        return "super"
+    if discount_percent >= 15:
+        return "strong"
+    if discount_percent >= 10:
+        return "good"
+    return "weak"
 
 
-def is_bad_image_url(image_url: Optional[str]) -> bool:
-    if not image_url:
-        return True
-
-    lowered = image_url.lower()
-    # Evita immagini placeholder generiche (es. logo Prime) nei post.
-    bad_markers = (
-        "prime",
-        "nav-sprite",
-        "amazon-logo",
-        "icon",
-        "sprite",
-    )
-    return any(marker in lowered for marker in bad_markers)
-
-
-def sanitize_old_price(current_price: Optional[str], old_price: Optional[str]) -> Optional[str]:
-    current = parse_price_to_float(current_price)
-    old = parse_price_to_float(old_price)
-
-    if current is None or old is None:
-        return None
-
-    if old <= current:
-        return None
-
-    return format_eur(old)
-
-
-def is_placeholder_title(title: str) -> bool:
-    normalized = (title or "").strip().lower()
-    return normalized in {"", "offerta amazon", "galleria prodotti"}
-
-
-def is_bad_image_url(image_url: Optional[str]) -> bool:
-    if not image_url:
-        return True
-
-    lowered = image_url.lower()
-    # Evita immagini placeholder generiche (es. logo Prime) nei post.
-    bad_markers = (
-        "prime",
-        "nav-sprite",
-        "amazon-logo",
-        "icon",
-        "sprite",
-    )
-    return any(marker in lowered for marker in bad_markers)
-
-
-def sanitize_old_price(current_price: Optional[str], old_price: Optional[str]) -> Optional[str]:
-    current = parse_price_to_float(current_price)
-    old = parse_price_to_float(old_price)
-
-    if current is None or old is None:
-        return None
-
-    if old <= current:
-        return None
-
-    return format_eur(old)
-
-
-def is_placeholder_title(title: str) -> bool:
-    normalized = (title or "").strip().lower()
-    return normalized in {"", "offerta amazon", "galleria prodotti"}
-
-
-def is_bad_image_url(image_url: Optional[str]) -> bool:
-    if not image_url:
-        return True
-
-    lowered = image_url.lower()
-    # Evita immagini placeholder generiche (es. logo Prime) nei post.
-    bad_markers = (
-        "prime",
-        "nav-sprite",
-        "amazon-logo",
-        "icon",
-        "sprite",
-    )
-    return any(marker in lowered for marker in bad_markers)
-
-
-def sanitize_old_price(current_price: Optional[str], old_price: Optional[str]) -> Optional[str]:
-    current = parse_price_to_float(current_price)
-    old = parse_price_to_float(old_price)
-
-    if current is None or old is None:
-        return None
-
-    if old <= current:
-        return None
-
-    return format_eur(old)
-
-
-def is_placeholder_title(title: str) -> bool:
-    normalized = (title or "").strip().lower()
-    return normalized in {"", "offerta amazon", "galleria prodotti"}
-
-
-def is_bad_image_url(image_url: Optional[str]) -> bool:
-    if not image_url:
-        return True
-
-    lowered = image_url.lower()
-    # Evita immagini placeholder generiche (es. logo Prime) nei post.
-    bad_markers = (
-        "prime",
-        "nav-sprite",
-        "amazon-logo",
-        "icon",
-        "sprite",
-    )
-    return any(marker in lowered for marker in bad_markers)
-
-
-def sanitize_old_price(current_price: Optional[str], old_price: Optional[str]) -> Optional[str]:
-    current = parse_price_to_float(current_price)
-    old = parse_price_to_float(old_price)
-
-    if current is None or old is None:
-        return None
-
-    if old <= current:
-        return None
-
-    return format_eur(old)
+def discount_badge(discount_percent: Optional[float]) -> str:
+    tier = discount_tier(discount_percent)
+    mapping = {
+        "error_price": "🚨 ERRORE DI PREZZO?",
+        "bomba": "💣 PREZZO BOMBA",
+        "flash": "🎯 OFFERTA FLASH",
+        "super": "🚀 SUPER OFFERTA",
+        "strong": "🔥 PREZZO TOP",
+        "good": "✅ BUON PREZZO",
+        "weak": "ℹ️ PREZZO IN CALO",
+        "unknown": "💥 PREZZO INTERESSANTE",
+    }
+    return mapping.get(tier, "💥 PREZZO INTERESSANTE")
 
 
 def is_placeholder_title(title: str) -> bool:
@@ -502,7 +399,7 @@ def get_amazon_data(
         tag = soup.select_one(selector)
         if tag:
             text = tag.get_text(strip=True)
-            if text and "€" in text:
+            if text and "€" in text and not is_unit_price_text(text):
                 old_price = text
                 break
 
@@ -639,49 +536,104 @@ def build_caption(
 
 
 def build_marketing_angle(price: str, discount_percent: Optional[float]) -> str:
-    if discount_percent is None:
-        templates = [
-            "💥 In offerta a {}",
-            "👉 Prezzo interessante: {}",
-            "💸 Sotto i radar a {}",
-        ]
-    elif discount_percent >= 35:
-        templates = [
+    tier = discount_tier(discount_percent)
+    templates_by_tier = {
+        "error_price": [
+            "🚨 Possibile errore di prezzo: {}",
+            "⚠️ Prezzo anomalo trovato a {}",
+            "💥 Potrebbe essere errore di prezzo: {}",
+        ],
+        "bomba": [
+            "💣 Prezzo bomba: {}",
             "💥 Ora a {}",
             "🔥 Scende a {}",
-            "📉 Calato a {}",
-        ]
-    elif discount_percent >= 20:
-        templates = [
-            "💥 In offerta a {}",
             "💸 Trovato a {}",
+        ],
+        "flash": [
+            "⚡ Offerta lampo a {}",
+            "💥 In offerta a {}",
+            "📉 Calato a {}",
             "👉 Si prende a {}",
-        ]
-    else:
-        templates = [
+        ],
+        "super": [
+            "🔥 Scende a {}",
+            "💸 Sotto i radar a {}",
+            "👉 Prezzo interessante: {}",
+            "💥 Ora a {}",
+        ],
+        "strong": [
+            "📉 Calato a {}",
             "🔥 Buon prezzo: {}",
+            "👉 Si prende a {}",
+            "💸 Trovato a {}",
+        ],
+        "good": [
+            "🔥 Buon prezzo: {}",
+            "💸 Sotto i radar a {}",
+            "👉 Prezzo interessante: {}",
+            "💥 In offerta a {}",
+        ],
+        "weak": [
+            "📌 Prezzo in calo: {}",
+            "👉 Prezzo interessante: {}",
+            "💸 Trovato a {}",
+        ],
+        "unknown": [
+            "💥 In offerta a {}",
             "👉 Prezzo interessante: {}",
             "💸 Sotto i radar a {}",
-        ]
-
+        ],
+    }
+    templates = templates_by_tier.get(tier, templates_by_tier["unknown"])
     return random.choice(templates).format(price)
 
 
 def build_urgency_line(discount_percent: Optional[float]) -> str:
-    high_urgency = [
-        "Sta andando via veloce",
-        "Finché dura",
-        "Difficile rivederlo a questo prezzo",
-    ]
-    medium_urgency = [
-        "Di solito costa di più",
-        "Finché dura",
-        "Sta andando via veloce",
-    ]
+    tier = discount_tier(discount_percent)
+    urgency_by_tier = {
+        "error_price": [
+            "Difficile rivederlo a questo prezzo",
+            "Sta andando via veloce",
+            "Finché dura",
+        ],
+        "bomba": [
+            "Finché dura",
+            "Sta andando via veloce",
+            "Difficile rivederlo a questo prezzo",
+        ],
+        "flash": [
+            "Sta andando via veloce",
+            "Finché dura",
+            "Di solito costa di più",
+        ],
+        "super": [
+            "Di solito costa di più",
+            "Finché dura",
+            "Sta andando via veloce",
+        ],
+        "strong": [
+            "Di solito costa di più",
+            "Sta andando via veloce",
+            "Finché dura",
+        ],
+        "good": [
+            "Di solito costa di più",
+            "Può risalire presto",
+            "Finché dura",
+        ],
+        "weak": [
+            "Prezzo discreto ma da monitorare",
+            "Tieni d'occhio eventuali ribassi extra",
+            "Potrebbe calare ancora",
+        ],
+        "unknown": [
+            "Controlla subito disponibilità e coupon",
+            "Può cambiare rapidamente",
+            "Finché dura",
+        ],
+    }
+    return random.choice(urgency_by_tier.get(tier, urgency_by_tier["unknown"]))
 
-    if discount_percent is not None and discount_percent >= 25:
-        return random.choice(high_urgency)
-    return random.choice(medium_urgency)
 
 def pick_best_asin(deals: Dict[str, Any], sent_asins: Set[str]) -> Optional[str]:
     items = deals.get("dr") or []
