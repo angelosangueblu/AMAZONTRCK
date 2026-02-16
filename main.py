@@ -26,8 +26,7 @@ class Config:
     interval_seconds: int = 300
     first_delay_seconds: int = 20
     max_deals_per_cycle: int = 40
-    min_discount_percent: float = 30.0
-    super_discount_percent: float = 50.0
+    max_keepa_queries_per_cycle: int = 8
     state_file: str = "sent_asins.json"
 
 
@@ -293,6 +292,40 @@ def sanitize_old_price(current_price: Optional[str], old_price: Optional[str]) -
     return format_eur(old)
 
 
+def is_placeholder_title(title: str) -> bool:
+    normalized = (title or "").strip().lower()
+    return normalized in {"", "offerta amazon", "galleria prodotti"}
+
+
+def is_bad_image_url(image_url: Optional[str]) -> bool:
+    if not image_url:
+        return True
+
+    lowered = image_url.lower()
+    # Evita immagini placeholder generiche (es. logo Prime) nei post.
+    bad_markers = (
+        "prime",
+        "nav-sprite",
+        "amazon-logo",
+        "icon",
+        "sprite",
+    )
+    return any(marker in lowered for marker in bad_markers)
+
+
+def sanitize_old_price(current_price: Optional[str], old_price: Optional[str]) -> Optional[str]:
+    current = parse_price_to_float(current_price)
+    old = parse_price_to_float(old_price)
+
+    if current is None or old is None:
+        return None
+
+    if old <= current:
+        return None
+
+    return format_eur(old)
+
+
 # -------- PRENDI DATI AMAZON --------
 def get_amazon_data(
     session: requests.Session,
@@ -439,40 +472,6 @@ def enrich_from_keepa_product(product: Dict[str, Any]) -> Tuple[Optional[str], O
     return title, image_url
 
 
-
-
-def sanitize_title_for_caption(title: str, max_len: int = 120) -> str:
-    clean = re.sub(r"\s+", " ", (title or "Offerta Amazon")).strip()
-    if len(clean) <= max_len:
-        return clean
-    return clean[: max_len - 1].rstrip() + "…"
-
-
-def is_discount_eligible(discount_percent: Optional[float], min_discount_percent: float) -> bool:
-    if discount_percent is None:
-        return False
-    return discount_percent >= min_discount_percent
-
-
-def deal_sort_key(deal_item: Dict[str, Any]) -> float:
-    score = extract_keepa_discount_percent(deal_item)
-    if score is None:
-        return -1.0
-    return float(score)
-
-
-def build_marketing_cta(discount_percent: Optional[float]) -> str:
-    if discount_percent is None:
-        return "👉 Apri ora l'offerta e verifica la disponibilità."
-
-    if discount_percent >= 50:
-        return "⚡ Sconto rarissimo: prendilo prima che finisca!"
-
-    if discount_percent >= 40:
-        return "🏃 Ottimo prezzo: aggiungilo subito al carrello!"
-
-    return "🛒 Offerta valida: controlla subito il prezzo live."
-
 def build_caption(
     title: str,
     price: str,
@@ -509,6 +508,7 @@ def pick_best_asin(deals: Dict[str, Any], sent_asins: Set[str]) -> Optional[str]
     return None
 
 
+
 def product_looks_eligible(product_payload: Dict[str, Any], price: Optional[str]) -> bool:
     if not has_valid_current_price(price):
         return False
@@ -526,6 +526,32 @@ def trim_sent_asins(sent_asins: Set[str], limit: int = 5000) -> Set[str]:
 
     return set(sorted(sent_asins)[-limit:])
 
+
+def fetch_keepa_deals(api: keepa.Keepa) -> Optional[Dict[str, Any]]:
+    payload = {
+        "domainId": 8,
+        "priceTypes": [0],
+        "deltaPercentRange": [15, 90],
+    }
+
+    try:
+        return api.deals(payload)
+    except Exception as exc:
+        logger.warning("Keepa deals non disponibile (tentativo 1): %s", exc)
+
+    # Fallback più permissivo quando Keepa risponde con errori temporanei/503.
+    fallback_payload = {
+        "domainId": 8,
+        "priceTypes": [0],
+        "deltaPercentRange": [10, 90],
+    }
+
+    try:
+        return api.deals(fallback_payload)
+    except Exception as exc:
+        logger.warning("Keepa deals non disponibile (tentativo 2): %s", exc)
+        return None
+
 # ---------------- AUTO OFFERTE ----------------
 async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
     loop = asyncio.get_running_loop()
@@ -534,29 +560,20 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
     session = context.application.bot_data["http_session"]
 
     try:
-        deals = await loop.run_in_executor(
-            None,
-            lambda: api.deals(
-                {
-                    "domainId": 8,
-                    "priceTypes": [0],
-                    "deltaPercentRange": [25, 90],
-                }
-            ),
-        )
+        deals = await loop.run_in_executor(None, lambda: fetch_keepa_deals(api))
 
         if not deals or "dr" not in deals:
-            logger.info("Nessuna offerta trovata")
+            logger.info("Nessuna offerta trovata (Keepa assente o vuoto)")
             return
 
         sent_asins = load_sent_asins(cfg.state_file)
         deal_items = deals.get("dr") or []
-        deal_items = sorted(deal_items, key=deal_sort_key, reverse=True)
         if not deal_items:
             logger.info("Keepa ha restituito lista offerte vuota")
             return
 
         scanned = 0
+        keepa_queries_done = 0
         for deal_item in deal_items[: cfg.max_deals_per_cycle]:
             asin = deal_item.get("asin")
             if not asin:
@@ -578,14 +595,23 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
                 logger.warning("Scraping Amazon fallito per %s: %s", asin, exc)
                 title, price, old_price, image_url = "Offerta Amazon", None, None, None
 
-            try:
-                keepa_products = await loop.run_in_executor(None, lambda asin=asin: api.query(asin))
-            except Exception as exc:
-                logger.warning("Query Keepa fallita per %s: %s", asin, exc)
-                keepa_products = []
+            product_payload: Dict[str, Any] = {}
+            keepa_title: Optional[str] = None
+            keepa_image_url: Optional[str] = None
 
-            product_payload = keepa_products[0] if keepa_products else {}
-            keepa_title, keepa_image_url = enrich_from_keepa_product(product_payload)
+            need_keepa_query = is_placeholder_title(title) or (not price) or is_bad_image_url(image_url)
+            if need_keepa_query and keepa_queries_done < cfg.max_keepa_queries_per_cycle:
+                try:
+                    keepa_products = await loop.run_in_executor(None, lambda asin=asin: api.query(asin))
+                    keepa_queries_done += 1
+                except Exception as exc:
+                    logger.warning("Query Keepa fallita per %s: %s", asin, exc)
+                    keepa_products = []
+
+                product_payload = keepa_products[0] if keepa_products else {}
+                keepa_title, keepa_image_url = enrich_from_keepa_product(product_payload)
+            elif need_keepa_query:
+                logger.info("Budget query Keepa esaurito nel ciclo, skip enrich per %s", asin)
 
             if is_placeholder_title(title) and keepa_title:
                 title = keepa_title
@@ -602,15 +628,6 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
             keepa_discount = extract_keepa_discount_percent(deal_item)
             old_price = sanitize_old_price(price, old_price)
             discount_percent = compute_discount_percent(price, old_price, keepa_discount)
-
-            if not is_discount_eligible(discount_percent, cfg.min_discount_percent):
-                logger.info(
-                    "Deal scartato (%s): sconto %.1f%% sotto soglia %.1f%%",
-                    asin,
-                    discount_percent if discount_percent is not None else -1.0,
-                    cfg.min_discount_percent,
-                )
-                continue
 
             link = "https://www.amazon.it/dp/{}?tag={}".format(asin, cfg.affiliate_tag)
             caption = build_caption(title, price or "Prezzo non disponibile", old_price, link, discount_percent)
@@ -635,7 +652,7 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.info("Offerta inviata correttamente per %s", asin)
             return
 
-        logger.info("Nessuna offerta idonea inviata in questo ciclo (analizzati: %s, soglia sconto: %.1f%%)", scanned, cfg.min_discount_percent)
+        logger.info("Nessuna offerta idonea inviata in questo ciclo (analizzati: %s, query_keepa: %s)", scanned, keepa_queries_done)
 
     except Exception:
         logger.exception("Errore durante l'invio offerta")
