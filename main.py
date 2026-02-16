@@ -27,7 +27,7 @@ class Config:
     interval_seconds: int = 300
     first_delay_seconds: int = 20
     max_deals_per_cycle: int = 40
-    max_keepa_queries_per_cycle: int = 8
+    max_keepa_queries_per_cycle: int = 30
     min_discount_percent: float = 10.0
     state_file: str = "sent_asins.json"
 
@@ -482,14 +482,57 @@ def pick_best_deal(deals: Dict[str, Any], sent_asins: Set[str]) -> Optional[Dict
 
 
 def extract_keepa_discount_percent(deal_item: Dict[str, Any]) -> Optional[float]:
-    for key in ("deltaPercent", "delta", "savingsPercent"):
+    for key in ("deltaPercent", "delta", "savingsPercent", "dealPercent"):
         value = deal_item.get(key)
-        if isinstance(value, (int, float)):
-            if value > 100:
-                value = value / 100.0
-            if value <= 0:
-                return None
-            return float(value)
+        if not isinstance(value, (int, float)):
+            continue
+
+        value = abs(float(value))
+        if value == 0:
+            continue
+
+        # Keepa può restituire scale diverse (es: 1500 => 15.00%).
+        if value > 1000:
+            value = value / 100.0
+        elif value > 100:
+            value = value / 10.0
+
+        if value <= 0:
+            continue
+
+        return round(value, 1)
+
+    return None
+
+
+def extract_discount_from_keepa_product_stats(product: Dict[str, Any], current_price_text: Optional[str]) -> Optional[float]:
+    current = parse_price_to_float(current_price_text)
+    if current is None or current <= 0:
+        return None
+
+    stats = product.get("stats") if isinstance(product, dict) else None
+    if not isinstance(stats, dict):
+        return None
+
+    # Preferiamo medie recenti per avere uno sconto realistico.
+    for key in ("avg30", "avg90", "avg180"):
+        value = stats.get(key)
+        baseline_cents = value[1] if isinstance(value, (list, tuple)) and len(value) > 1 else value
+        baseline = keepa_cents_to_eur_text(baseline_cents)
+        baseline_value = parse_price_to_float(baseline)
+        if baseline_value is None or baseline_value <= current:
+            continue
+
+        return round(((baseline_value - current) / baseline_value) * 100.0, 1)
+
+    return None
+
+
+def extract_title_from_deal_item(deal_item: Dict[str, Any]) -> Optional[str]:
+    for key in ("title", "productTitle", "name"):
+        value = deal_item.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
     return None
 
 
@@ -768,7 +811,7 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
             keepa_title: Optional[str] = None
             keepa_image_url: Optional[str] = None
 
-            need_keepa_query = is_low_quality_title(title) or (not price) or is_bad_image_url(image_url)
+            need_keepa_query = is_low_quality_title(title) or (not price)
             if need_keepa_query and keepa_queries_done < cfg.max_keepa_queries_per_cycle:
                 try:
                     keepa_products = await loop.run_in_executor(None, lambda asin=asin: api.query(asin))
@@ -791,6 +834,11 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
                     logger.warning("Prezzo Amazon non trovato per %s, uso fallback Keepa: %s", asin, price)
 
             if is_low_quality_title(title):
+                fallback_title = extract_title_from_deal_item(deal_item)
+                if fallback_title and not is_low_quality_title(fallback_title):
+                    title = fallback_title
+
+            if is_low_quality_title(title):
                 logger.info("Deal scartato (%s): titolo non affidabile", asin)
                 continue
 
@@ -800,7 +848,12 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
 
             keepa_discount = extract_keepa_discount_percent(deal_item)
             old_price = sanitize_old_price(price, old_price)
-            discount_percent = compute_discount_percent(price, old_price, keepa_discount)
+
+            stats_discount = None
+            if keepa_discount is None:
+                stats_discount = extract_discount_from_keepa_product_stats(product_payload, price)
+
+            discount_percent = compute_discount_percent(price, old_price, keepa_discount or stats_discount)
 
             if not discount_is_eligible(discount_percent, cfg.min_discount_percent):
                 logger.info(
