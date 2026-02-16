@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
 from dataclasses import dataclass
 from io import BytesIO
@@ -27,6 +28,7 @@ class Config:
     first_delay_seconds: int = 20
     max_deals_per_cycle: int = 40
     max_keepa_queries_per_cycle: int = 8
+    min_discount_percent: float = 10.0
     state_file: str = "sent_asins.json"
 
 
@@ -326,6 +328,40 @@ def sanitize_old_price(current_price: Optional[str], old_price: Optional[str]) -
     return format_eur(old)
 
 
+def is_placeholder_title(title: str) -> bool:
+    normalized = (title or "").strip().lower()
+    return normalized in {"", "offerta amazon", "galleria prodotti"}
+
+
+def is_bad_image_url(image_url: Optional[str]) -> bool:
+    if not image_url:
+        return True
+
+    lowered = image_url.lower()
+    # Evita immagini placeholder generiche (es. logo Prime) nei post.
+    bad_markers = (
+        "prime",
+        "nav-sprite",
+        "amazon-logo",
+        "icon",
+        "sprite",
+    )
+    return any(marker in lowered for marker in bad_markers)
+
+
+def sanitize_old_price(current_price: Optional[str], old_price: Optional[str]) -> Optional[str]:
+    current = parse_price_to_float(current_price)
+    old = parse_price_to_float(old_price)
+
+    if current is None or old is None:
+        return None
+
+    if old <= current:
+        return None
+
+    return format_eur(old)
+
+
 # -------- PRENDI DATI AMAZON --------
 def get_amazon_data(
     session: requests.Session,
@@ -441,6 +477,8 @@ def extract_keepa_discount_percent(deal_item: Dict[str, Any]) -> Optional[float]
         if isinstance(value, (int, float)):
             if value > 100:
                 value = value / 100.0
+            if value <= 0:
+                return None
             return float(value)
     return None
 
@@ -480,7 +518,8 @@ def build_caption(
     discount_percent: Optional[float],
 ) -> str:
     badge = discount_badge(discount_percent)
-    title_line = sanitize_title_for_caption(title)
+    angle_line = build_marketing_angle(price, discount_percent)
+    urgency_line = build_urgency_line(discount_percent)
 
     if old_price:
         price_line = "🔴 Ora {} invece di {}".format(price, old_price)
@@ -488,13 +527,63 @@ def build_caption(
         price_line = "🔴 Prezzo lampo: {}".format(price)
 
     if discount_percent is not None:
-        discount_line = "📉 Risparmio: -{}%".format(str(discount_percent).replace(".", ","))
+        discount_line = "\n📉 Sconto: -{}%".format(str(discount_percent).replace(".", ","))
+
+    return "{}\n{}\n{}\n{}{}\n⏳ {}\n{}".format(
+        badge,
+        title,
+        angle_line,
+        price_line,
+        discount_line,
+        urgency_line,
+        link,
+    )
+
+
+def build_marketing_angle(price: str, discount_percent: Optional[float]) -> str:
+    if discount_percent is None:
+        templates = [
+            "💥 In offerta a {}",
+            "👉 Prezzo interessante: {}",
+            "💸 Sotto i radar a {}",
+        ]
+    elif discount_percent >= 35:
+        templates = [
+            "💥 Ora a {}",
+            "🔥 Scende a {}",
+            "📉 Calato a {}",
+        ]
+    elif discount_percent >= 20:
+        templates = [
+            "💥 In offerta a {}",
+            "💸 Trovato a {}",
+            "👉 Si prende a {}",
+        ]
     else:
-        discount_line = "📉 Sconto: in aggiornamento"
+        templates = [
+            "🔥 Buon prezzo: {}",
+            "👉 Prezzo interessante: {}",
+            "💸 Sotto i radar a {}",
+        ]
 
-    cta_line = build_marketing_cta(discount_percent)
-    return "\n".join([badge, title_line, price_line, discount_line, cta_line, link])
+    return random.choice(templates).format(price)
 
+
+def build_urgency_line(discount_percent: Optional[float]) -> str:
+    high_urgency = [
+        "Sta andando via veloce",
+        "Finché dura",
+        "Difficile rivederlo a questo prezzo",
+    ]
+    medium_urgency = [
+        "Di solito costa di più",
+        "Finché dura",
+        "Sta andando via veloce",
+    ]
+
+    if discount_percent is not None and discount_percent >= 25:
+        return random.choice(high_urgency)
+    return random.choice(medium_urgency)
 
 def pick_best_asin(deals: Dict[str, Any], sent_asins: Set[str]) -> Optional[str]:
     items = deals.get("dr") or []
@@ -518,6 +607,12 @@ def product_looks_eligible(product_payload: Dict[str, Any], price: Optional[str]
         return False
 
     return True
+
+
+def discount_is_eligible(discount_percent: Optional[float], min_discount_percent: float) -> bool:
+    if discount_percent is None:
+        return False
+    return discount_percent >= min_discount_percent
 
 
 def trim_sent_asins(sent_asins: Set[str], limit: int = 5000) -> Set[str]:
@@ -628,6 +723,15 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
             keepa_discount = extract_keepa_discount_percent(deal_item)
             old_price = sanitize_old_price(price, old_price)
             discount_percent = compute_discount_percent(price, old_price, keepa_discount)
+
+            if not discount_is_eligible(discount_percent, cfg.min_discount_percent):
+                logger.info(
+                    "Deal scartato (%s): sconto insufficiente (%s%% < %s%%)",
+                    asin,
+                    "n/d" if discount_percent is None else str(discount_percent).replace(".", ","),
+                    str(cfg.min_discount_percent).replace(".", ","),
+                )
+                continue
 
             link = "https://www.amazon.it/dp/{}?tag={}".format(asin, cfg.affiliate_tag)
             caption = build_caption(title, price or "Prezzo non disponibile", old_price, link, discount_percent)
