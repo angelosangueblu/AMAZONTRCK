@@ -207,11 +207,11 @@ def compute_discount_percent(current_price: Optional[str], old_price: Optional[s
 
 
 def discount_badge(discount_percent: Optional[float]) -> str:
-    if discount_percent is None:
-        return "🛍️ OFFERTA FLASH"
+    if discount_percent >= 15:
+        return "🛍️ OFFERTA FLASH🛍️"
 
     if discount_percent >= 70:
-        return "🚨 MEGA BUG DI PREZZO? 🚨"
+        return "🚨 ERRORE DI PREZZO 🚨"
 
     if discount_percent >= 50:
         return "💣 SCONTO PAZZESCO 💣"
@@ -223,6 +223,40 @@ def discount_badge(discount_percent: Optional[float]) -> str:
         return "✅ SUPER OFFERTA ✅"
 
     return "✨ PREZZO SCONTATO ✨"
+
+
+def is_placeholder_title(title: str) -> bool:
+    normalized = (title or "").strip().lower()
+    return normalized in {"", "offerta amazon", "galleria prodotti"}
+
+
+def is_bad_image_url(image_url: Optional[str]) -> bool:
+    if not image_url:
+        return True
+
+    lowered = image_url.lower()
+    # Evita immagini placeholder generiche (es. logo Prime) nei post.
+    bad_markers = (
+        "prime",
+        "nav-sprite",
+        "amazon-logo",
+        "icon",
+        "sprite",
+    )
+    return any(marker in lowered for marker in bad_markers)
+
+
+def sanitize_old_price(current_price: Optional[str], old_price: Optional[str]) -> Optional[str]:
+    current = parse_price_to_float(current_price)
+    old = parse_price_to_float(old_price)
+
+    if current is None or old is None:
+        return None
+
+    if old <= current:
+        return None
+
+    return format_eur(old)
 
 
 def is_placeholder_title(title: str) -> bool:
