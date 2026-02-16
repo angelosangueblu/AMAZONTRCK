@@ -159,16 +159,6 @@ def is_target_product(title: str, product_payload: Dict[str, Any]) -> Tuple[bool
     return False, "fuori nicchia"
 
 
-def resolve_state_path(path: str) -> str:
-    state_path = Path(path)
-    if state_path.is_absolute():
-        return str(state_path)
-
-    # Mantiene lo stato stabile anche dopo restart/cwd diversi
-    base_dir = Path(__file__).resolve().parent
-    return str(base_dir / state_path)
-
-
 # -------- STATO ASIN INVIATI --------
 def normalize_asin(value: Any) -> Optional[str]:
     if not isinstance(value, str):
@@ -180,7 +170,7 @@ def normalize_asin(value: Any) -> Optional[str]:
 
 
 def load_sent_asins(path: str) -> Set[str]:
-    state_path = Path(resolve_state_path(path))
+    state_path = Path(path)
     if not state_path.exists():
         return set()
 
@@ -597,10 +587,11 @@ def build_caption(
     urgency_line = build_urgency_line(discount_percent)
 
     if old_price:
-        price_line = "🔴 Ora {} invece di {}".format(price, old_price)
+        price_line = "⭕{} anziché {}".format(price, old_price)
     else:
-        price_line = "🔴 Prezzo lampo: {}".format(price)
+        price_line = "⭕{}".format(price)
 
+    discount_line = ""
     if discount_percent is not None:
         discount_line = "\n📉 Sconto: -{}%".format(str(discount_percent).replace(".", ","))
 
