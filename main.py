@@ -96,6 +96,16 @@ setup_logging()
 logger = logging.getLogger("amazon_deals_bot")
 
 
+def resolve_state_path(path: str) -> str:
+    state_path = Path(path)
+    if state_path.is_absolute():
+        return str(state_path)
+
+    # Mantiene lo stato stabile anche dopo restart/cwd diversi
+    base_dir = Path(__file__).resolve().parent
+    return str(base_dir / state_path)
+
+
 # -------- STATO ASIN INVIATI --------
 def normalize_asin(value: Any) -> Optional[str]:
     if not isinstance(value, str):
@@ -107,7 +117,7 @@ def normalize_asin(value: Any) -> Optional[str]:
 
 
 def load_sent_asins(path: str) -> Set[str]:
-    state_path = Path(path)
+    state_path = Path(resolve_state_path(path))
     if not state_path.exists():
         return set()
 
@@ -221,19 +231,158 @@ def compute_discount_percent(current_price: Optional[str], old_price: Optional[s
 
 
 def discount_badge(discount_percent: Optional[float]) -> str:
-    if discount_percent is None:
-        return "💥 PREZZO INTERESSANTE"
+    if discount_percent >= 15:
+        return "🛍️ OFFERTA FLASH🛍️"
 
-    if discount_percent > 40:
-        return "❌ POSSIBILE ERRORE ❌"
+    if discount_percent >= 70:
+        return "🚨 ERRORE DI PREZZO 🚨"
 
-    if 15 <= discount_percent <= 20:
-        return "💣 PREZZO BOMBA 💣"
+    if discount_percent >= 50:
+        return "💣 SCONTO PAZZESCO 💣"
 
-    if discount_percent < 15:
-        return "🔥 PREZZO AFFARE 🔥"
+    if discount_percent >= 40:
+        return "🔥 PREZZO BOMBA 🔥"
 
-    return "‼️ SUPER PREZZO ‼️"
+    if discount_percent >= 30:
+        return "✅ SUPER OFFERTA ✅"
+
+    return "✨ PREZZO SCONTATO ✨"
+
+
+def is_placeholder_title(title: str) -> bool:
+    normalized = (title or "").strip().lower()
+    return normalized in {"", "offerta amazon", "galleria prodotti"}
+
+
+def is_bad_image_url(image_url: Optional[str]) -> bool:
+    if not image_url:
+        return True
+
+    lowered = image_url.lower()
+    # Evita immagini placeholder generiche (es. logo Prime) nei post.
+    bad_markers = (
+        "prime",
+        "nav-sprite",
+        "amazon-logo",
+        "icon",
+        "sprite",
+    )
+    return any(marker in lowered for marker in bad_markers)
+
+
+def sanitize_old_price(current_price: Optional[str], old_price: Optional[str]) -> Optional[str]:
+    current = parse_price_to_float(current_price)
+    old = parse_price_to_float(old_price)
+
+    if current is None or old is None:
+        return None
+
+    if old <= current:
+        return None
+
+    return format_eur(old)
+
+
+def is_placeholder_title(title: str) -> bool:
+    normalized = (title or "").strip().lower()
+    return normalized in {"", "offerta amazon", "galleria prodotti"}
+
+
+def is_bad_image_url(image_url: Optional[str]) -> bool:
+    if not image_url:
+        return True
+
+    lowered = image_url.lower()
+    # Evita immagini placeholder generiche (es. logo Prime) nei post.
+    bad_markers = (
+        "prime",
+        "nav-sprite",
+        "amazon-logo",
+        "icon",
+        "sprite",
+    )
+    return any(marker in lowered for marker in bad_markers)
+
+
+def sanitize_old_price(current_price: Optional[str], old_price: Optional[str]) -> Optional[str]:
+    current = parse_price_to_float(current_price)
+    old = parse_price_to_float(old_price)
+
+    if current is None or old is None:
+        return None
+
+    if old <= current:
+        return None
+
+    return format_eur(old)
+
+
+def is_placeholder_title(title: str) -> bool:
+    normalized = (title or "").strip().lower()
+    return normalized in {"", "offerta amazon", "galleria prodotti"}
+
+
+def is_bad_image_url(image_url: Optional[str]) -> bool:
+    if not image_url:
+        return True
+
+    lowered = image_url.lower()
+    # Evita immagini placeholder generiche (es. logo Prime) nei post.
+    bad_markers = (
+        "prime",
+        "nav-sprite",
+        "amazon-logo",
+        "icon",
+        "sprite",
+    )
+    return any(marker in lowered for marker in bad_markers)
+
+
+def sanitize_old_price(current_price: Optional[str], old_price: Optional[str]) -> Optional[str]:
+    current = parse_price_to_float(current_price)
+    old = parse_price_to_float(old_price)
+
+    if current is None or old is None:
+        return None
+
+    if old <= current:
+        return None
+
+    return format_eur(old)
+
+
+def is_placeholder_title(title: str) -> bool:
+    normalized = (title or "").strip().lower()
+    return normalized in {"", "offerta amazon", "galleria prodotti"}
+
+
+def is_bad_image_url(image_url: Optional[str]) -> bool:
+    if not image_url:
+        return True
+
+    lowered = image_url.lower()
+    # Evita immagini placeholder generiche (es. logo Prime) nei post.
+    bad_markers = (
+        "prime",
+        "nav-sprite",
+        "amazon-logo",
+        "icon",
+        "sprite",
+    )
+    return any(marker in lowered for marker in bad_markers)
+
+
+def sanitize_old_price(current_price: Optional[str], old_price: Optional[str]) -> Optional[str]:
+    current = parse_price_to_float(current_price)
+    old = parse_price_to_float(old_price)
+
+    if current is None or old is None:
+        return None
+
+    if old <= current:
+        return None
+
+    return format_eur(old)
 
 
 def is_placeholder_title(title: str) -> bool:
@@ -471,11 +620,10 @@ def build_caption(
     urgency_line = build_urgency_line(discount_percent)
 
     if old_price:
-        price_line = "⭕{} anziché {}".format(price, old_price)
+        price_line = "🔴 Ora {} invece di {}".format(price, old_price)
     else:
-        price_line = "⭕{}".format(price)
+        price_line = "🔴 Prezzo lampo: {}".format(price)
 
-    discount_line = ""
     if discount_percent is not None:
         discount_line = "\n📉 Sconto: -{}%".format(str(discount_percent).replace(".", ","))
 
