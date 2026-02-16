@@ -24,10 +24,11 @@ class Config:
     keepa_key: str
     channel_id: int
     affiliate_tag: str
-    interval_seconds: int = 300
-    first_delay_seconds: int = 20
+    interval_seconds: int = 180
+    first_delay_seconds: int = 15
     max_deals_per_cycle: int = 40
     max_keepa_queries_per_cycle: int = 30
+    max_alerts_per_cycle: int = 3
     min_discount_percent: float = 10.0
     state_file: str = "sent_asins.json"
 
@@ -60,6 +61,13 @@ def load_config() -> Config:
         keepa_key=keepa_key,
         channel_id=int(channel_id),
         affiliate_tag=affiliate_tag,
+        interval_seconds=int(os.getenv("INTERVAL_SECONDS", "180")),
+        first_delay_seconds=int(os.getenv("FIRST_DELAY_SECONDS", "15")),
+        max_deals_per_cycle=int(os.getenv("MAX_DEALS_PER_CYCLE", "40")),
+        max_keepa_queries_per_cycle=int(os.getenv("MAX_KEEPA_QUERIES_PER_CYCLE", "30")),
+        max_alerts_per_cycle=int(os.getenv("MAX_ALERTS_PER_CYCLE", "3")),
+        min_discount_percent=float(os.getenv("MIN_DISCOUNT_PERCENT", "10")),
+        state_file=os.getenv("STATE_FILE", "sent_asins.json"),
     )
 
 
@@ -786,6 +794,7 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         scanned = 0
         keepa_queries_done = 0
+        sent_count = 0
         for deal_item in deal_items[: cfg.max_deals_per_cycle]:
             asin = normalize_asin(deal_item.get("asin"))
             if not asin:
@@ -899,10 +908,27 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
                 logger.warning("Invio Telegram fallito per %s: %s", asin, exc)
                 continue
 
-            logger.info("Offerta inviata correttamente per %s", asin)
-            return
+            sent_count += 1
+            logger.info(
+                "Offerta inviata correttamente per %s (%s/%s nel ciclo)",
+                asin,
+                sent_count,
+                cfg.max_alerts_per_cycle,
+            )
 
-        logger.info("Nessuna offerta idonea inviata in questo ciclo (analizzati: %s, query_keepa: %s)", scanned, keepa_queries_done)
+            if sent_count >= cfg.max_alerts_per_cycle:
+                logger.info("Raggiunto limite invii ciclo: %s", cfg.max_alerts_per_cycle)
+                return
+
+        if sent_count == 0:
+            logger.info("Nessuna offerta idonea inviata in questo ciclo (analizzati: %s, query_keepa: %s)", scanned, keepa_queries_done)
+        else:
+            logger.info(
+                "Ciclo completato: %s offerte inviate (analizzati: %s, query_keepa: %s)",
+                sent_count,
+                scanned,
+                keepa_queries_done,
+            )
 
     except Exception:
         logger.exception("Errore durante l'invio offerta")
