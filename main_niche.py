@@ -4,7 +4,7 @@ import logging
 import os
 import random
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -24,19 +24,12 @@ class Config:
     keepa_key: str
     channel_id: int
     affiliate_tag: str
-    interval_seconds: int = 180
-    first_delay_seconds: int = 15
+    interval_seconds: int = 300
+    first_delay_seconds: int = 20
     max_deals_per_cycle: int = 40
     max_keepa_queries_per_cycle: int = 8
-    keepa_query_timeout_seconds: float = 6.0
-    cycle_time_budget_seconds: int = 85
-    max_alerts_per_cycle: int = 3
-    min_discount_percent: float = 15.0
-    preferred_discount_percent: float = 25.0
-    min_absolute_saving_eur: float = 4.0
-    min_price_eur: float = 8.0
-    max_price_eur: float = 1200.0
-    state_file: str = "sent_asins.json"
+    min_discount_percent: float = 10.0
+    state_file: str = "sent_asins_niche.json"
 
 
 def load_config() -> Config:
@@ -67,58 +60,7 @@ def load_config() -> Config:
         keepa_key=keepa_key,
         channel_id=int(channel_id),
         affiliate_tag=affiliate_tag,
-        interval_seconds=int(os.getenv("INTERVAL_SECONDS", "180")),
-        first_delay_seconds=int(os.getenv("FIRST_DELAY_SECONDS", "15")),
-        max_deals_per_cycle=int(os.getenv("MAX_DEALS_PER_CYCLE", "40")),
-        max_keepa_queries_per_cycle=int(os.getenv("MAX_KEEPA_QUERIES_PER_CYCLE", "8")),
-        keepa_query_timeout_seconds=float(os.getenv("KEEPA_QUERY_TIMEOUT_SECONDS", "6")),
-        cycle_time_budget_seconds=int(os.getenv("CYCLE_TIME_BUDGET_SECONDS", "85")),
-        max_alerts_per_cycle=int(os.getenv("MAX_ALERTS_PER_CYCLE", "3")),
-        min_discount_percent=float(os.getenv("MIN_DISCOUNT_PERCENT", "15")),
-        preferred_discount_percent=float(os.getenv("PREFERRED_DISCOUNT_PERCENT", "25")),
-        min_absolute_saving_eur=float(os.getenv("MIN_ABSOLUTE_SAVING_EUR", "4")),
-        min_price_eur=float(os.getenv("MIN_PRICE_EUR", "8")),
-        max_price_eur=float(os.getenv("MAX_PRICE_EUR", "1200")),
-        state_file=os.getenv("STATE_FILE", "sent_asins.json"),
     )
-
-
-def validate_config(cfg: Config) -> Config:
-    fixed = cfg
-
-    if fixed.interval_seconds < 60:
-        logger.warning("INTERVAL_SECONDS troppo basso (%s), imposto a 60", fixed.interval_seconds)
-        fixed = replace(fixed, interval_seconds=60)
-
-    if fixed.max_alerts_per_cycle < 1:
-        logger.warning("MAX_ALERTS_PER_CYCLE non valido (%s), imposto a 1", fixed.max_alerts_per_cycle)
-        fixed = replace(fixed, max_alerts_per_cycle=1)
-
-    if fixed.max_keepa_queries_per_cycle < 0:
-        logger.warning("MAX_KEEPA_QUERIES_PER_CYCLE non valido (%s), imposto a 0", fixed.max_keepa_queries_per_cycle)
-        fixed = replace(fixed, max_keepa_queries_per_cycle=0)
-
-    if fixed.preferred_discount_percent < fixed.min_discount_percent:
-        logger.warning(
-            "PREFERRED_DISCOUNT_PERCENT (%s) < MIN_DISCOUNT_PERCENT (%s), allineo al minimo",
-            fixed.preferred_discount_percent,
-            fixed.min_discount_percent,
-        )
-        fixed = replace(fixed, preferred_discount_percent=fixed.min_discount_percent)
-
-    if fixed.min_price_eur < 0:
-        logger.warning("MIN_PRICE_EUR non valido (%s), imposto a 0", fixed.min_price_eur)
-        fixed = replace(fixed, min_price_eur=0.0)
-
-    if fixed.max_price_eur <= fixed.min_price_eur:
-        logger.warning(
-            "MAX_PRICE_EUR (%s) <= MIN_PRICE_EUR (%s), imposto max=1200",
-            fixed.max_price_eur,
-            fixed.min_price_eur,
-        )
-        fixed = replace(fixed, max_price_eur=1200.0)
-
-    return fixed
 
 
 def build_http_session() -> requests.Session:
@@ -151,17 +93,70 @@ def setup_logging() -> None:
 
 
 setup_logging()
-logger = logging.getLogger("amazon_deals_bot")
+logger = logging.getLogger("amazon_deals_bot_niche")
 
 
-def resolve_state_path(path: str) -> str:
-    state_path = Path(path)
-    if state_path.is_absolute():
-        return str(state_path)
+TARGET_KEYWORDS_IT: Dict[str, Set[str]] = {
+    "informatica": {
+        "mouse", "tastiera", "usb", "hdmi", "router", "modem", "power bank", "powerbank",
+        "ssd", "hard disk", "hdd", "webcam", "micro sd", "scheda sd", "hub usb", "monitor",
+        "stampante", "cartuccia", "cuffie", "notebook", "laptop stand", "supporto notebook",
+    },
+    "cibo": {
+        "caffè", "capsule", "cialde", "pasta", "riso", "tonno", "olio", "biscotti", "snack",
+        "cioccolato", "proteine", "barretta", "the", "tè", "bevanda", "acqua", "integratore",
+    },
+    "casa": {
+        "aspirapolvere", "robot", "scopa", "detersivo", "padella", "pentola", "lampada",
+        "deumidificatore", "umidificatore", "contenitore", "organizer", "lenzuola", "cuscino",
+        "coperta", "stendibiancheria", "mocio", "anticalcare", "pulizia", "cucina",
+    },
+}
 
-    # Mantiene lo stato stabile anche dopo restart/cwd diversi
-    base_dir = Path(__file__).resolve().parent
-    return str(base_dir / state_path)
+
+def normalize_text(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    normalized = value.lower().replace("’", "'")
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized.strip()
+
+
+def extract_product_taxonomy_text(product_payload: Dict[str, Any]) -> str:
+    parts: List[str] = []
+    if not isinstance(product_payload, dict):
+        return ""
+
+    for key in ("title", "brand", "manufacturer"):
+        value = product_payload.get(key)
+        if isinstance(value, str):
+            parts.append(value)
+
+    category_tree = product_payload.get("categoryTree")
+    if isinstance(category_tree, list):
+        for node in category_tree:
+            if isinstance(node, dict):
+                name = node.get("name")
+                if isinstance(name, str):
+                    parts.append(name)
+
+    return normalize_text(" ".join(parts))
+
+
+def is_target_product(title: str, product_payload: Dict[str, Any]) -> Tuple[bool, str]:
+    combined = normalize_text(title)
+    taxonomy_text = extract_product_taxonomy_text(product_payload)
+    if taxonomy_text:
+        combined = f"{combined} {taxonomy_text}".strip()
+
+    if not combined:
+        return False, "testo prodotto assente"
+
+    for category, keywords in TARGET_KEYWORDS_IT.items():
+        if any(keyword in combined for keyword in keywords):
+            return True, category
+
+    return False, "fuori nicchia"
 
 
 # -------- STATO ASIN INVIATI --------
@@ -175,7 +170,7 @@ def normalize_asin(value: Any) -> Optional[str]:
 
 
 def load_sent_asins(path: str) -> Set[str]:
-    state_path = Path(resolve_state_path(path))
+    state_path = Path(path)
     if not state_path.exists():
         return set()
 
@@ -204,25 +199,9 @@ def load_sent_asins(path: str) -> Set[str]:
 
 def save_sent_asins(path: str, asins: Set[str]) -> None:
     cleaned = [asin for asin in sorted(asins) if normalize_asin(asin)]
-    state_path = Path(path)
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-
-    tmp_path = state_path.with_suffix(state_path.suffix + ".tmp")
-    tmp_path.write_text(
+    Path(path).write_text(
         json.dumps({"sent_asins": cleaned}, ensure_ascii=False, indent=2),
         encoding="utf-8",
-    )
-    tmp_path.replace(state_path)
-
-
-def is_unit_price_text(text: Optional[str]) -> bool:
-    if not text:
-        return False
-
-    normalized = text.lower().replace(" ", "")
-    return bool(
-        re.search(r"/(kg|g|gr|l|ml|cl|m|cm|mq|pz|unità)", normalized)
-        or re.search(r"al(kg|l)", normalized)
     )
 
 
@@ -556,57 +535,14 @@ def pick_best_deal(deals: Dict[str, Any], sent_asins: Set[str]) -> Optional[Dict
 
 
 def extract_keepa_discount_percent(deal_item: Dict[str, Any]) -> Optional[float]:
-    for key in ("deltaPercent", "delta", "savingsPercent", "dealPercent"):
+    for key in ("deltaPercent", "delta", "savingsPercent"):
         value = deal_item.get(key)
-        if not isinstance(value, (int, float)):
-            continue
-
-        value = abs(float(value))
-        if value == 0:
-            continue
-
-        # Keepa può restituire scale diverse (es: 1500 => 15.00%).
-        if value > 1000:
-            value = value / 100.0
-        elif value > 100:
-            value = value / 10.0
-
-        if value <= 0:
-            continue
-
-        return round(value, 1)
-
-    return None
-
-
-def extract_discount_from_keepa_product_stats(product: Dict[str, Any], current_price_text: Optional[str]) -> Optional[float]:
-    current = parse_price_to_float(current_price_text)
-    if current is None or current <= 0:
-        return None
-
-    stats = product.get("stats") if isinstance(product, dict) else None
-    if not isinstance(stats, dict):
-        return None
-
-    # Preferiamo medie recenti per avere uno sconto realistico.
-    for key in ("avg30", "avg90", "avg180"):
-        value = stats.get(key)
-        baseline_cents = value[1] if isinstance(value, (list, tuple)) and len(value) > 1 else value
-        baseline = keepa_cents_to_eur_text(baseline_cents)
-        baseline_value = parse_price_to_float(baseline)
-        if baseline_value is None or baseline_value <= current:
-            continue
-
-        return round(((baseline_value - current) / baseline_value) * 100.0, 1)
-
-    return None
-
-
-def extract_title_from_deal_item(deal_item: Dict[str, Any]) -> Optional[str]:
-    for key in ("title", "productTitle", "name"):
-        value = deal_item.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
+        if isinstance(value, (int, float)):
+            if value > 100:
+                value = value / 100.0
+            if value <= 0:
+                return None
+            return float(value)
     return None
 
 
@@ -651,10 +587,11 @@ def build_caption(
     urgency_line = build_urgency_line(discount_percent)
 
     if old_price:
-        price_line = "🔴 Ora {} invece di {}".format(price, old_price)
+        price_line = "⭕{} anziché {}".format(price, old_price)
     else:
-        price_line = "🔴 Prezzo lampo: {}".format(price)
+        price_line = "⭕{}".format(price)
 
+    discount_line = ""
     if discount_percent is not None:
         discount_line = "\n📉 Sconto: -{}%".format(str(discount_percent).replace(".", ","))
 
@@ -793,56 +730,10 @@ def product_looks_eligible(product_payload: Dict[str, Any], price: Optional[str]
     return True
 
 
-def price_is_in_operating_range(price_text: Optional[str], cfg: Config) -> bool:
-    value = parse_price_to_float(price_text)
-    if value is None:
-        return False
-
-    return cfg.min_price_eur <= value <= cfg.max_price_eur
-
-
 def discount_is_eligible(discount_percent: Optional[float], min_discount_percent: float) -> bool:
     if discount_percent is None:
         return False
     return discount_percent >= min_discount_percent
-
-
-def required_discount_threshold(cfg: Config, scanned: int, sent_count: int) -> float:
-    preferred = max(cfg.preferred_discount_percent, cfg.min_discount_percent)
-    if sent_count > 0:
-        return cfg.min_discount_percent
-
-    # Prima metà ciclo: qualità alta. Seconda metà: fallback minimo per mantenere il ritmo.
-    if scanned <= max(1, cfg.max_deals_per_cycle // 2):
-        return preferred
-    return cfg.min_discount_percent
-
-
-def compute_saving_eur(current_price: Optional[str], old_price: Optional[str], discount_percent: Optional[float]) -> Optional[float]:
-    current = parse_price_to_float(current_price)
-    old = parse_price_to_float(old_price)
-
-    if current is None or current <= 0:
-        return None
-
-    if old is not None and old > current:
-        return round(old - current, 2)
-
-    if discount_percent is not None and discount_percent > 0 and discount_percent < 95:
-        inferred_old = current / (1 - (discount_percent / 100.0))
-        if inferred_old > current:
-            return round(inferred_old - current, 2)
-
-    return None
-
-
-def build_deal_score(discount_percent: Optional[float], saving_eur: Optional[float], has_image: bool, title_quality_ok: bool, has_reference_price: bool) -> float:
-    discount_component = float(discount_percent or 0.0) * 2.2
-    saving_component = float(saving_eur or 0.0) * 1.7
-    image_bonus = 2.0 if has_image else 0.0
-    title_bonus = 1.0 if title_quality_ok else 0.0
-    reference_bonus = 2.5 if has_reference_price else 0.0
-    return round(discount_component + saving_component + image_bonus + title_bonus + reference_bonus, 2)
 
 
 def trim_sent_asins(sent_asins: Set[str], limit: int = 5000) -> Set[str]:
@@ -884,10 +775,6 @@ def fetch_keepa_deals(api: keepa.Keepa) -> Optional[Dict[str, Any]]:
         logger.warning("Keepa deals non disponibile (tentativo 2): %s", exc)
         return None
 
-
-def cycle_time_exceeded(cycle_started_at: float, budget_seconds: int) -> bool:
-    return (asyncio.get_running_loop().time() - cycle_started_at) >= float(budget_seconds)
-
 # ---------------- AUTO OFFERTE ----------------
 async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
     loop = asyncio.get_running_loop()
@@ -910,17 +797,7 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         scanned = 0
         keepa_queries_done = 0
-        cycle_started_at = loop.time()
-        candidates: List[Dict[str, Any]] = []
-
         for deal_item in deal_items[: cfg.max_deals_per_cycle]:
-            if cycle_time_exceeded(cycle_started_at, cfg.cycle_time_budget_seconds):
-                logger.info(
-                    "Budget tempo ciclo raggiunto (%ss), termino scan per mantenere costanza",
-                    cfg.cycle_time_budget_seconds,
-                )
-                break
-
             asin = normalize_asin(deal_item.get("asin"))
             if not asin:
                 logger.info("Deal scartato: asin mancante")
@@ -945,21 +822,11 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
             keepa_title: Optional[str] = None
             keepa_image_url: Optional[str] = None
 
-            need_keepa_query = is_low_quality_title(title) or (not price)
+            need_keepa_query = is_low_quality_title(title) or (not price) or is_bad_image_url(image_url)
             if need_keepa_query and keepa_queries_done < cfg.max_keepa_queries_per_cycle:
                 try:
-                    keepa_products = await asyncio.wait_for(
-                        loop.run_in_executor(None, lambda asin=asin: api.query(asin)),
-                        timeout=cfg.keepa_query_timeout_seconds,
-                    )
+                    keepa_products = await loop.run_in_executor(None, lambda asin=asin: api.query(asin))
                     keepa_queries_done += 1
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        "Query Keepa timeout per %s (>%ss), skip",
-                        asin,
-                        cfg.keepa_query_timeout_seconds,
-                    )
-                    keepa_products = []
                 except Exception as exc:
                     logger.warning("Query Keepa fallita per %s: %s", asin, exc)
                     keepa_products = []
@@ -977,103 +844,63 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
                 if price:
                     logger.warning("Prezzo Amazon non trovato per %s, uso fallback Keepa: %s", asin, price)
 
-            if is_low_quality_title(title):
-                fallback_title = extract_title_from_deal_item(deal_item)
-                if fallback_title and not is_low_quality_title(fallback_title):
-                    title = fallback_title
+            is_target, target_reason = is_target_product(title, product_payload)
+            if not is_target and not product_payload and keepa_queries_done < cfg.max_keepa_queries_per_cycle:
+                try:
+                    keepa_products = await loop.run_in_executor(None, lambda asin=asin: api.query(asin))
+                    keepa_queries_done += 1
+                    product_payload = select_matching_keepa_product(keepa_products, asin)
+                    keepa_title, keepa_image_url = enrich_from_keepa_product(product_payload)
+                    if is_low_quality_title(title) and keepa_title:
+                        title = keepa_title
+                except Exception as exc:
+                    logger.warning("Query Keepa extra (filtro nicchia) fallita per %s: %s", asin, exc)
+
+                is_target, target_reason = is_target_product(title, product_payload)
+
+            if not is_target:
+                logger.info("Deal scartato (%s): %s", asin, target_reason)
+                continue
 
             if is_low_quality_title(title):
-                title = "Offerta Amazon ({})".format(asin)
-                logger.warning("Titolo non affidabile per %s, uso fallback sintetico", asin)
+                logger.info("Deal scartato (%s): titolo non affidabile", asin)
+                continue
 
             if not product_looks_eligible(product_payload, price):
                 logger.info("Deal scartato (%s): prezzo/metadata non validi", asin)
                 continue
 
-            if not price_is_in_operating_range(price, cfg):
-                logger.info(
-                    "Deal scartato (%s): prezzo fuori range operativo (%s€-%s€)",
-                    asin,
-                    str(cfg.min_price_eur).replace(".", ","),
-                    str(cfg.max_price_eur).replace(".", ","),
-                )
-                continue
-
             keepa_discount = extract_keepa_discount_percent(deal_item)
             old_price = sanitize_old_price(price, old_price)
+            discount_percent = compute_discount_percent(price, old_price, keepa_discount)
 
-            stats_discount = None
-            if keepa_discount is None:
-                stats_discount = extract_discount_from_keepa_product_stats(product_payload, price)
-
-            discount_percent = compute_discount_percent(price, old_price, keepa_discount or stats_discount)
-            required_discount = required_discount_threshold(cfg, scanned, len(candidates))
-            if not discount_is_eligible(discount_percent, required_discount):
+            if not discount_is_eligible(discount_percent, cfg.min_discount_percent):
                 logger.info(
                     "Deal scartato (%s): sconto insufficiente (%s%% < %s%%)",
                     asin,
                     "n/d" if discount_percent is None else str(discount_percent).replace(".", ","),
-                    str(required_discount).replace(".", ","),
+                    str(cfg.min_discount_percent).replace(".", ","),
                 )
                 continue
-
-            saving_eur = compute_saving_eur(price, old_price, discount_percent)
-            if saving_eur is None or saving_eur < cfg.min_absolute_saving_eur:
-                logger.info(
-                    "Deal scartato (%s): risparmio assoluto basso (%s€ < %s€)",
-                    asin,
-                    "n/d" if saving_eur is None else str(saving_eur).replace(".", ","),
-                    str(cfg.min_absolute_saving_eur).replace(".", ","),
-                )
-                continue
-
-            if is_bad_image_url(image_url) and keepa_image_url:
-                image_url = keepa_image_url
 
             link = "https://www.amazon.it/dp/{}?tag={}".format(asin, cfg.affiliate_tag)
             caption = build_caption(title, price or "Prezzo non disponibile", old_price, link, discount_percent)
-            score = build_deal_score(
-                discount_percent=discount_percent,
-                saving_eur=saving_eur,
-                has_image=bool(image_url and not is_bad_image_url(image_url)),
-                title_quality_ok=not is_low_quality_title(title),
-                has_reference_price=old_price is not None,
-            )
 
-            candidates.append(
-                {
-                    "asin": asin,
-                    "image_url": image_url,
-                    "caption": caption,
-                    "score": score,
-                    "discount_percent": discount_percent,
-                    "saving_eur": saving_eur,
-                }
-            )
-
-        if not candidates:
-            logger.info(
-                "Nessuna offerta idonea inviata in questo ciclo (analizzati: %s, query_keepa: %s)",
-                scanned,
-                keepa_queries_done,
-            )
-            return
-
-        candidates.sort(key=lambda c: (c["score"], c.get("discount_percent") or 0.0, c.get("saving_eur") or 0.0), reverse=True)
-
-        sent_count = 0
-        for candidate in candidates:
-            if sent_count >= cfg.max_alerts_per_cycle:
-                break
-
-            asin = candidate["asin"]
-            image_url = candidate.get("image_url")
-            caption = candidate["caption"]
-
+            # Salva subito lo stato per evitare duplicati in caso di riavvio/crash
+            # subito dopo l'invio Telegram.
             sent_asins.add(asin)
             save_sent_asins(cfg.state_file, trim_sent_asins(sent_asins))
 
             sent = False
+            if is_bad_image_url(image_url) and keepa_image_url:
+                image_url = keepa_image_url
+
+            if is_bad_image_url(image_url):
+                logger.info("Deal scartato (%s): immagine non disponibile/valida", asin)
+                sent_asins.discard(asin)
+                save_sent_asins(cfg.state_file, trim_sent_asins(sent_asins))
+                continue
+
             try:
                 if image_url and not is_bad_image_url(image_url):
                     image_bytes = await loop.run_in_executor(
@@ -1091,30 +918,10 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
                 logger.warning("Invio Telegram fallito per %s: %s", asin, exc)
                 continue
 
-            sent_count += 1
-            logger.info(
-                "Offerta inviata correttamente per %s (%s/%s nel ciclo, score=%s)",
-                asin,
-                sent_count,
-                cfg.max_alerts_per_cycle,
-                candidate["score"],
-            )
-
-        if sent_count == 0:
-            logger.info(
-                "Candidati trovati ma nessun invio riuscito (analizzati: %s, query_keepa: %s)",
-                scanned,
-                keepa_queries_done,
-            )
+            logger.info("Offerta inviata correttamente per %s", asin)
             return
 
-        logger.info(
-            "Ciclo completato: %s offerte inviate su %s candidati (analizzati: %s, query_keepa: %s)",
-            sent_count,
-            len(candidates),
-            scanned,
-            keepa_queries_done,
-        )
+        logger.info("Nessuna offerta idonea inviata in questo ciclo (analizzati: %s, query_keepa: %s)", scanned, keepa_queries_done)
 
     except Exception:
         logger.exception("Errore durante l'invio offerta")
@@ -1122,8 +929,8 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ---------------- AVVIO ----------------
 def main() -> None:
-    cfg = validate_config(load_config())
-    logger.info("Avvio bot offerte Amazon")
+    cfg = load_config()
+    logger.info("Avvio bot offerte Amazon (nicchie: informatica/casa/cibo)")
 
     app = ApplicationBuilder().token(cfg.bot_token).build()
     app.bot_data["config"] = cfg
