@@ -4,7 +4,7 @@ import logging
 import os
 import random
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -31,7 +31,11 @@ class Config:
     keepa_query_timeout_seconds: float = 6.0
     cycle_time_budget_seconds: int = 85
     max_alerts_per_cycle: int = 3
-    min_discount_percent: float = 10.0
+    min_discount_percent: float = 15.0
+    preferred_discount_percent: float = 25.0
+    min_absolute_saving_eur: float = 4.0
+    min_price_eur: float = 8.0
+    max_price_eur: float = 1200.0
     state_file: str = "sent_asins.json"
 
 
@@ -70,9 +74,51 @@ def load_config() -> Config:
         keepa_query_timeout_seconds=float(os.getenv("KEEPA_QUERY_TIMEOUT_SECONDS", "6")),
         cycle_time_budget_seconds=int(os.getenv("CYCLE_TIME_BUDGET_SECONDS", "85")),
         max_alerts_per_cycle=int(os.getenv("MAX_ALERTS_PER_CYCLE", "3")),
-        min_discount_percent=float(os.getenv("MIN_DISCOUNT_PERCENT", "10")),
+        min_discount_percent=float(os.getenv("MIN_DISCOUNT_PERCENT", "15")),
+        preferred_discount_percent=float(os.getenv("PREFERRED_DISCOUNT_PERCENT", "25")),
+        min_absolute_saving_eur=float(os.getenv("MIN_ABSOLUTE_SAVING_EUR", "4")),
+        min_price_eur=float(os.getenv("MIN_PRICE_EUR", "8")),
+        max_price_eur=float(os.getenv("MAX_PRICE_EUR", "1200")),
         state_file=os.getenv("STATE_FILE", "sent_asins.json"),
     )
+
+
+def validate_config(cfg: Config) -> Config:
+    fixed = cfg
+
+    if fixed.interval_seconds < 60:
+        logger.warning("INTERVAL_SECONDS troppo basso (%s), imposto a 60", fixed.interval_seconds)
+        fixed = replace(fixed, interval_seconds=60)
+
+    if fixed.max_alerts_per_cycle < 1:
+        logger.warning("MAX_ALERTS_PER_CYCLE non valido (%s), imposto a 1", fixed.max_alerts_per_cycle)
+        fixed = replace(fixed, max_alerts_per_cycle=1)
+
+    if fixed.max_keepa_queries_per_cycle < 0:
+        logger.warning("MAX_KEEPA_QUERIES_PER_CYCLE non valido (%s), imposto a 0", fixed.max_keepa_queries_per_cycle)
+        fixed = replace(fixed, max_keepa_queries_per_cycle=0)
+
+    if fixed.preferred_discount_percent < fixed.min_discount_percent:
+        logger.warning(
+            "PREFERRED_DISCOUNT_PERCENT (%s) < MIN_DISCOUNT_PERCENT (%s), allineo al minimo",
+            fixed.preferred_discount_percent,
+            fixed.min_discount_percent,
+        )
+        fixed = replace(fixed, preferred_discount_percent=fixed.min_discount_percent)
+
+    if fixed.min_price_eur < 0:
+        logger.warning("MIN_PRICE_EUR non valido (%s), imposto a 0", fixed.min_price_eur)
+        fixed = replace(fixed, min_price_eur=0.0)
+
+    if fixed.max_price_eur <= fixed.min_price_eur:
+        logger.warning(
+            "MAX_PRICE_EUR (%s) <= MIN_PRICE_EUR (%s), imposto max=1200",
+            fixed.max_price_eur,
+            fixed.min_price_eur,
+        )
+        fixed = replace(fixed, max_price_eur=1200.0)
+
+    return fixed
 
 
 def build_http_session() -> requests.Session:
@@ -158,9 +204,25 @@ def load_sent_asins(path: str) -> Set[str]:
 
 def save_sent_asins(path: str, asins: Set[str]) -> None:
     cleaned = [asin for asin in sorted(asins) if normalize_asin(asin)]
-    Path(path).write_text(
+    state_path = Path(path)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+
+    tmp_path = state_path.with_suffix(state_path.suffix + ".tmp")
+    tmp_path.write_text(
         json.dumps({"sent_asins": cleaned}, ensure_ascii=False, indent=2),
         encoding="utf-8",
+    )
+    tmp_path.replace(state_path)
+
+
+def is_unit_price_text(text: Optional[str]) -> bool:
+    if not text:
+        return False
+
+    normalized = text.lower().replace(" ", "")
+    return bool(
+        re.search(r"/(kg|g|gr|l|ml|cl|m|cm|mq|pz|unità)", normalized)
+        or re.search(r"al(kg|l)", normalized)
     )
 
 
@@ -731,10 +793,56 @@ def product_looks_eligible(product_payload: Dict[str, Any], price: Optional[str]
     return True
 
 
+def price_is_in_operating_range(price_text: Optional[str], cfg: Config) -> bool:
+    value = parse_price_to_float(price_text)
+    if value is None:
+        return False
+
+    return cfg.min_price_eur <= value <= cfg.max_price_eur
+
+
 def discount_is_eligible(discount_percent: Optional[float], min_discount_percent: float) -> bool:
     if discount_percent is None:
         return False
     return discount_percent >= min_discount_percent
+
+
+def required_discount_threshold(cfg: Config, scanned: int, sent_count: int) -> float:
+    preferred = max(cfg.preferred_discount_percent, cfg.min_discount_percent)
+    if sent_count > 0:
+        return cfg.min_discount_percent
+
+    # Prima metà ciclo: qualità alta. Seconda metà: fallback minimo per mantenere il ritmo.
+    if scanned <= max(1, cfg.max_deals_per_cycle // 2):
+        return preferred
+    return cfg.min_discount_percent
+
+
+def compute_saving_eur(current_price: Optional[str], old_price: Optional[str], discount_percent: Optional[float]) -> Optional[float]:
+    current = parse_price_to_float(current_price)
+    old = parse_price_to_float(old_price)
+
+    if current is None or current <= 0:
+        return None
+
+    if old is not None and old > current:
+        return round(old - current, 2)
+
+    if discount_percent is not None and discount_percent > 0 and discount_percent < 95:
+        inferred_old = current / (1 - (discount_percent / 100.0))
+        if inferred_old > current:
+            return round(inferred_old - current, 2)
+
+    return None
+
+
+def build_deal_score(discount_percent: Optional[float], saving_eur: Optional[float], has_image: bool, title_quality_ok: bool, has_reference_price: bool) -> float:
+    discount_component = float(discount_percent or 0.0) * 2.2
+    saving_component = float(saving_eur or 0.0) * 1.7
+    image_bonus = 2.0 if has_image else 0.0
+    title_bonus = 1.0 if title_quality_ok else 0.0
+    reference_bonus = 2.5 if has_reference_price else 0.0
+    return round(discount_component + saving_component + image_bonus + title_bonus + reference_bonus, 2)
 
 
 def trim_sent_asins(sent_asins: Set[str], limit: int = 5000) -> Set[str]:
@@ -802,8 +910,9 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         scanned = 0
         keepa_queries_done = 0
-        sent_count = 0
         cycle_started_at = loop.time()
+        candidates: List[Dict[str, Any]] = []
+
         for deal_item in deal_items[: cfg.max_deals_per_cycle]:
             if cycle_time_exceeded(cycle_started_at, cfg.cycle_time_budget_seconds):
                 logger.info(
@@ -881,6 +990,15 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
                 logger.info("Deal scartato (%s): prezzo/metadata non validi", asin)
                 continue
 
+            if not price_is_in_operating_range(price, cfg):
+                logger.info(
+                    "Deal scartato (%s): prezzo fuori range operativo (%s€-%s€)",
+                    asin,
+                    str(cfg.min_price_eur).replace(".", ","),
+                    str(cfg.max_price_eur).replace(".", ","),
+                )
+                continue
+
             keepa_discount = extract_keepa_discount_percent(deal_item)
             old_price = sanitize_old_price(price, old_price)
 
@@ -889,39 +1007,73 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
                 stats_discount = extract_discount_from_keepa_product_stats(product_payload, price)
 
             discount_percent = compute_discount_percent(price, old_price, keepa_discount or stats_discount)
-
-            if discount_percent is None and has_valid_current_price(price):
-                discount_percent = cfg.min_discount_percent
-                logger.warning(
-                    "Sconto non disponibile per %s, uso fallback minimo %s%%",
-                    asin,
-                    str(cfg.min_discount_percent).replace(".", ","),
-                )
-
-            if not discount_is_eligible(discount_percent, cfg.min_discount_percent):
+            required_discount = required_discount_threshold(cfg, scanned, len(candidates))
+            if not discount_is_eligible(discount_percent, required_discount):
                 logger.info(
                     "Deal scartato (%s): sconto insufficiente (%s%% < %s%%)",
                     asin,
                     "n/d" if discount_percent is None else str(discount_percent).replace(".", ","),
-                    str(cfg.min_discount_percent).replace(".", ","),
+                    str(required_discount).replace(".", ","),
                 )
                 continue
 
+            saving_eur = compute_saving_eur(price, old_price, discount_percent)
+            if saving_eur is None or saving_eur < cfg.min_absolute_saving_eur:
+                logger.info(
+                    "Deal scartato (%s): risparmio assoluto basso (%s€ < %s€)",
+                    asin,
+                    "n/d" if saving_eur is None else str(saving_eur).replace(".", ","),
+                    str(cfg.min_absolute_saving_eur).replace(".", ","),
+                )
+                continue
+
+            if is_bad_image_url(image_url) and keepa_image_url:
+                image_url = keepa_image_url
+
             link = "https://www.amazon.it/dp/{}?tag={}".format(asin, cfg.affiliate_tag)
             caption = build_caption(title, price or "Prezzo non disponibile", old_price, link, discount_percent)
+            score = build_deal_score(
+                discount_percent=discount_percent,
+                saving_eur=saving_eur,
+                has_image=bool(image_url and not is_bad_image_url(image_url)),
+                title_quality_ok=not is_low_quality_title(title),
+                has_reference_price=old_price is not None,
+            )
 
-            # Salva subito lo stato per evitare duplicati in caso di riavvio/crash
-            # subito dopo l'invio Telegram.
+            candidates.append(
+                {
+                    "asin": asin,
+                    "image_url": image_url,
+                    "caption": caption,
+                    "score": score,
+                    "discount_percent": discount_percent,
+                    "saving_eur": saving_eur,
+                }
+            )
+
+        if not candidates:
+            logger.info(
+                "Nessuna offerta idonea inviata in questo ciclo (analizzati: %s, query_keepa: %s)",
+                scanned,
+                keepa_queries_done,
+            )
+            return
+
+        candidates.sort(key=lambda c: (c["score"], c.get("discount_percent") or 0.0, c.get("saving_eur") or 0.0), reverse=True)
+
+        sent_count = 0
+        for candidate in candidates:
+            if sent_count >= cfg.max_alerts_per_cycle:
+                break
+
+            asin = candidate["asin"]
+            image_url = candidate.get("image_url")
+            caption = candidate["caption"]
+
             sent_asins.add(asin)
             save_sent_asins(cfg.state_file, trim_sent_asins(sent_asins))
 
             sent = False
-            if is_bad_image_url(image_url) and keepa_image_url:
-                image_url = keepa_image_url
-
-            if is_bad_image_url(image_url):
-                logger.info("Immagine non valida per %s, invio alert testuale", asin)
-
             try:
                 if image_url and not is_bad_image_url(image_url):
                     image_bytes = await loop.run_in_executor(
@@ -941,25 +1093,28 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
 
             sent_count += 1
             logger.info(
-                "Offerta inviata correttamente per %s (%s/%s nel ciclo)",
+                "Offerta inviata correttamente per %s (%s/%s nel ciclo, score=%s)",
                 asin,
                 sent_count,
                 cfg.max_alerts_per_cycle,
+                candidate["score"],
             )
 
-            if sent_count >= cfg.max_alerts_per_cycle:
-                logger.info("Raggiunto limite invii ciclo: %s", cfg.max_alerts_per_cycle)
-                return
-
         if sent_count == 0:
-            logger.info("Nessuna offerta idonea inviata in questo ciclo (analizzati: %s, query_keepa: %s)", scanned, keepa_queries_done)
-        else:
             logger.info(
-                "Ciclo completato: %s offerte inviate (analizzati: %s, query_keepa: %s)",
-                sent_count,
+                "Candidati trovati ma nessun invio riuscito (analizzati: %s, query_keepa: %s)",
                 scanned,
                 keepa_queries_done,
             )
+            return
+
+        logger.info(
+            "Ciclo completato: %s offerte inviate su %s candidati (analizzati: %s, query_keepa: %s)",
+            sent_count,
+            len(candidates),
+            scanned,
+            keepa_queries_done,
+        )
 
     except Exception:
         logger.exception("Errore durante l'invio offerta")
@@ -967,7 +1122,7 @@ async def auto_offers(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ---------------- AVVIO ----------------
 def main() -> None:
-    cfg = load_config()
+    cfg = validate_config(load_config())
     logger.info("Avvio bot offerte Amazon")
 
     app = ApplicationBuilder().token(cfg.bot_token).build()
